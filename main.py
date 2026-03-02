@@ -175,66 +175,8 @@ def _yield_curve_at(df: pd.DataFrame, country: str, ref_date) -> pd.Series:
 
 # ─── 사이드바 네비게이션 ────────────────────────────────────────────────────
 
-# 기본값 (조건부 위젯이 렌더링되지 않을 때 사용)
-bond_view    = "Analysis"
-analysis_sub = "글로벌 국채 금리"
-domestic_sub = "채권 금리"
-raw_sub      = "글로벌 국채 금리"
-
 with st.sidebar:
-    # ── 계층 들여쓰기 CSS ─────────────────────────────────────────────────────
-    # nav-lN 마커 div 이후에 등장하는 stRadio 형제를 레벨별로 들여씀.
-    # 같은 specificity에서 나중에 선언된 규칙이 이기므로 깊은 레벨일수록
-    # 더 큰 padding-left가 적용됨(cascade 이용).
-    st.markdown("""
-    <style>
-    section[data-testid="stSidebar"]
-        [data-testid="stVerticalBlock"]
-        > div:has(.nav-l2) ~ div [data-testid="stRadio"] {
-            padding-left: 1.1rem;
-        }
-    section[data-testid="stSidebar"]
-        [data-testid="stVerticalBlock"]
-        > div:has(.nav-l3) ~ div [data-testid="stRadio"] {
-            padding-left: 2.2rem;
-        }
-    section[data-testid="stSidebar"]
-        [data-testid="stVerticalBlock"]
-        > div:has(.nav-l4) ~ div [data-testid="stRadio"] {
-            padding-left: 3.3rem;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
     asset_class = st.radio("", ["채권", "주식"], label_visibility="collapsed")
-
-    if asset_class == "채권":
-        st.markdown('<div class="nav-l2"></div>', unsafe_allow_html=True)
-        bond_view = st.radio(
-            "", ["Analysis", "Raw Data"],
-            key="bond_view", label_visibility="collapsed",
-        )
-
-        if bond_view == "Analysis":
-            st.markdown('<div class="nav-l3"></div>', unsafe_allow_html=True)
-            analysis_sub = st.radio(
-                "", ["글로벌 국채 금리", "국내 채권 금리"],
-                key="analysis_sub", label_visibility="collapsed",
-            )
-
-            if analysis_sub == "국내 채권 금리":
-                st.markdown('<div class="nav-l4"></div>', unsafe_allow_html=True)
-                domestic_sub = st.radio(
-                    "", ["채권 금리", "장외거래 대표수익률"],
-                    key="domestic_sub", label_visibility="collapsed",
-                )
-
-        elif bond_view == "Raw Data":
-            st.markdown('<div class="nav-l3"></div>', unsafe_allow_html=True)
-            raw_sub = st.radio(
-                "", ["글로벌 국채 금리", "국내 채권 금리", "장외 거래 대표수익률"],
-                key="raw_sub", label_visibility="collapsed",
-            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,356 +185,355 @@ with st.sidebar:
 
 if asset_class == "채권":
 
-    # ── Analysis ─────────────────────────────────────────────────────────────
-    if bond_view == "Analysis":
+    tab_global, tab_domestic, tab_otc, tab_raw = st.tabs([
+        "글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "Raw Data",
+    ])
 
-        # ── 글로벌 국채 금리 ─────────────────────────────────────────────────
-        if analysis_sub == "글로벌 국채 금리":
-            st.caption(
-                f"Source: investing.com + KOFIA  ·  기준일: {TODAY_STR}  ·  "
-                "주말·공휴일은 직전 거래일 값으로 채워짐"
+    # ── 글로벌 국채 금리 ─────────────────────────────────────────────────────
+    with tab_global:
+        st.caption(
+            f"Source: investing.com + KOFIA  ·  기준일: {TODAY_STR}  ·  "
+            "주말·공휴일은 직전 거래일 값으로 채워짐"
+        )
+
+        if _merged_df is None:
+            st.error(
+                "데이터 파일이 없습니다.  \n"
+                "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
             )
+        else:
+            st.subheader("주요국 금리 동향")
+            st.caption("2년물 / 10년물 기준  ·  bp = basis point (0.01%p)")
 
-            if _merged_df is None:
-                st.error(
-                    "데이터 파일이 없습니다.  \n"
-                    "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
-                )
-            else:
-                st.subheader("주요국 금리 동향")
-                st.caption("2년물 / 10년물 기준  ·  bp = basis point (0.01%p)")
+            summary_df = TreasuryCalc.build_change_summary(_merged_df, target_date=TARGET_DATE)
 
-                summary_df = TreasuryCalc.build_change_summary(_merged_df, target_date=TARGET_DATE)
+            format_dict = {}
+            for col in summary_df.columns:
+                col_label = col[1] if isinstance(col, tuple) else col
+                if "%" in col_label:
+                    format_dict[col] = "{:.3f}"
+                else:
+                    format_dict[col] = "{:.1f}"
 
-                format_dict = {}
-                for col in summary_df.columns:
-                    col_label = col[1] if isinstance(col, tuple) else col
-                    if "%" in col_label:
-                        format_dict[col] = "{:.3f}"
-                    else:
-                        format_dict[col] = "{:.1f}"
+            styled = summary_df.style.format(format_dict, na_rep="-")
+            bp_cols = [c for c in summary_df.columns if "금리" not in c[1]]
+            styled = styled.map(_color_bp, subset=bp_cols)
+            styled = styled.set_properties(**{"text-align": "center"})
+            st.dataframe(styled, use_container_width=True)
 
-                styled = summary_df.style.format(format_dict, na_rep="-")
-                bp_cols = [c for c in summary_df.columns if "금리" not in c[1]]
-                styled = styled.map(_color_bp, subset=bp_cols)
-                styled = styled.set_properties(**{"text-align": "center"})
-                st.dataframe(styled, use_container_width=True)
+            st.divider()
+            st.subheader("국가별 Yield Curve")
 
-                st.divider()
-                st.subheader("국가별 Yield Curve")
+            COUNTRY_MAP = {
+                "US": "미국", "KR": "한국", "DE": "독일",
+                "GB": "영국", "JP": "일본", "CN": "중국",
+            }
+            avail_countries = [
+                c for c in COUNTRIES
+                if any(f"{c}_{t}Y" in _merged_df.columns for t in TENORS)
+            ]
+            selected_code = st.selectbox(
+                "국가 선택",
+                options=avail_countries,
+                format_func=lambda x: COUNTRY_MAP.get(x, x),
+                key="curve_country",
+            )
+            selected_name = COUNTRY_MAP.get(selected_code, selected_code)
 
-                COUNTRY_MAP = {
-                    "US": "미국", "KR": "한국", "DE": "독일",
-                    "GB": "영국", "JP": "일본", "CN": "중국",
-                }
-                avail_countries = [
-                    c for c in COUNTRIES
-                    if any(f"{c}_{t}Y" in _merged_df.columns for t in TENORS)
-                ]
-                selected_code = st.selectbox(
-                    "국가 선택",
-                    options=avail_countries,
-                    format_func=lambda x: COUNTRY_MAP.get(x, x),
-                    key="curve_country",
-                )
-                selected_name = COUNTRY_MAP.get(selected_code, selected_code)
+            today_curve = _yield_curve_at(_merged_df, selected_code, TODAY)
+            week_curve  = _yield_curve_at(_merged_df, selected_code, TODAY - timedelta(days=7))
+            month_curve = _yield_curve_at(_merged_df, selected_code, TODAY - timedelta(days=30))
+            tenor_labels = [f"{t}Y" for t in TENORS]
 
-                today_curve = _yield_curve_at(_merged_df, selected_code, TODAY)
-                week_curve  = _yield_curve_at(_merged_df, selected_code, TODAY - timedelta(days=7))
-                month_curve = _yield_curve_at(_merged_df, selected_code, TODAY - timedelta(days=30))
-                tenor_labels = [f"{t}Y" for t in TENORS]
+            fig_curve = go.Figure()
+            if not today_curve.dropna().empty:
+                fig_curve.add_trace(go.Scatter(
+                    x=tenor_labels, y=today_curve.values,
+                    mode="lines+markers", name=f"현재 ({TODAY_STR})",
+                    line=dict(width=2.5),
+                ))
+            if not week_curve.dropna().empty:
+                fig_curve.add_trace(go.Scatter(
+                    x=tenor_labels, y=week_curve.values,
+                    mode="lines+markers", name="1주 전",
+                    line=dict(dash="dot", width=1.5), opacity=0.8,
+                ))
+            if not month_curve.dropna().empty:
+                fig_curve.add_trace(go.Scatter(
+                    x=tenor_labels, y=month_curve.values,
+                    mode="lines+markers", name="1개월 전",
+                    line=dict(dash="dash", width=1.5), opacity=0.8,
+                ))
+            fig_curve.update_layout(
+                title=f"{selected_name} 국채 금리 커브",
+                xaxis_title="만기", yaxis_title="수익률 (%)",
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_curve, use_container_width=True)
 
-                fig_curve = go.Figure()
-                if not today_curve.dropna().empty:
-                    fig_curve.add_trace(go.Scatter(
-                        x=tenor_labels, y=today_curve.values,
+            curve_data = {
+                "현재(%)": today_curve.values,
+                "1W(bp)":  (today_curve - week_curve).values * 100,
+                "1M(bp)":  (today_curve - month_curve).values * 100,
+            }
+            curve_table = pd.DataFrame(curve_data, index=pd.Index(tenor_labels, name="만기"))
+            curve_styled = (
+                curve_table.style
+                .format({"현재(%)": "{:.3f}", "1W(bp)": "{:.1f}", "1M(bp)": "{:.1f}"}, na_rep="-")
+                .map(_color_bp, subset=["1W(bp)", "1M(bp)"])
+                .set_properties(**{"text-align": "center"})
+            )
+            st.dataframe(curve_styled, use_container_width=True)
+
+    # ── 국내 채권 금리 ───────────────────────────────────────────────────────
+    with tab_domestic:
+        st.caption(
+            f"Source: KOFIA  ·  기준일: {TODAY_STR}  ·  "
+            "주말·공휴일은 직전 거래일 값으로 채워짐"
+        )
+
+        if _bond_df is None:
+            st.error(
+                "데이터 파일이 없습니다.  \n"
+                "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
+            )
+        else:
+            st.subheader("국내 채권 금리 동향")
+            st.caption("단위: 금리 (%), 변화 bp (0.01%p)")
+
+            bond_summary_df = _build_bond_summary(_bond_df, TARGET_DATE)
+            bond_format = {
+                "금리 (%)": "{:.3f}", "1D": "{:.1f}", "1W": "{:.1f}",
+                "MTD": "{:.1f}", "YTD": "{:.1f}", "YoY": "{:.1f}",
+            }
+            bp_cols_bond = [c for c in bond_summary_df.columns if c != "금리 (%)"]
+            bond_styled = (
+                bond_summary_df.style
+                .format(bond_format, na_rep="-")
+                .map(_color_bp, subset=bp_cols_bond)
+                .set_properties(**{"text-align": "center"})
+            )
+            st.dataframe(bond_styled, use_container_width=True)
+
+            st.divider()
+
+            ktb_avail = [t for t in KTB_TENORS if f"KTB_{t}Y" in _bond_df.columns]
+            if ktb_avail:
+                st.subheader("국내 채권 Yield Curve")
+                ktb_tenor_labels = [f"{t}Y" for t in ktb_avail]
+                ktb_cols         = [f"KTB_{t}Y" for t in ktb_avail]
+
+                def _ktb_curve_at(ref_date) -> pd.Series:
+                    avail_idx = _bond_df.index[_bond_df.index <= pd.Timestamp(ref_date)]
+                    if len(avail_idx) == 0:
+                        return pd.Series(float("nan"), index=ktb_avail, dtype=float)
+                    row = _bond_df.loc[avail_idx[-1], ktb_cols]
+                    return pd.Series(row.values, index=ktb_avail, dtype=float)
+
+                today_ktb = _ktb_curve_at(TODAY)
+                week_ktb  = _ktb_curve_at(TODAY - timedelta(days=7))
+                month_ktb = _ktb_curve_at(TODAY - timedelta(days=30))
+
+                fig_ktb = go.Figure()
+                if not today_ktb.dropna().empty:
+                    fig_ktb.add_trace(go.Scatter(
+                        x=ktb_tenor_labels, y=today_ktb.values,
                         mode="lines+markers", name=f"현재 ({TODAY_STR})",
                         line=dict(width=2.5),
                     ))
-                if not week_curve.dropna().empty:
-                    fig_curve.add_trace(go.Scatter(
-                        x=tenor_labels, y=week_curve.values,
+                if not week_ktb.dropna().empty:
+                    fig_ktb.add_trace(go.Scatter(
+                        x=ktb_tenor_labels, y=week_ktb.values,
                         mode="lines+markers", name="1주 전",
                         line=dict(dash="dot", width=1.5), opacity=0.8,
                     ))
-                if not month_curve.dropna().empty:
-                    fig_curve.add_trace(go.Scatter(
-                        x=tenor_labels, y=month_curve.values,
+                if not month_ktb.dropna().empty:
+                    fig_ktb.add_trace(go.Scatter(
+                        x=ktb_tenor_labels, y=month_ktb.values,
                         mode="lines+markers", name="1개월 전",
                         line=dict(dash="dash", width=1.5), opacity=0.8,
                     ))
-                fig_curve.update_layout(
-                    title=f"{selected_name} 국채 금리 커브",
+                fig_ktb.update_layout(
+                    title="국고채 금리 커브",
                     xaxis_title="만기", yaxis_title="수익률 (%)",
                     hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                st.plotly_chart(fig_curve, use_container_width=True)
+                st.plotly_chart(fig_ktb, use_container_width=True)
 
-                curve_data = {
-                    "현재(%)": today_curve.values,
-                    "1W(bp)":  (today_curve - week_curve).values * 100,
-                    "1M(bp)":  (today_curve - month_curve).values * 100,
+                ktb_curve_data = {
+                    "현재(%)": today_ktb.values,
+                    "1W(bp)":  (today_ktb - week_ktb).values * 100,
+                    "1M(bp)":  (today_ktb - month_ktb).values * 100,
                 }
-                curve_table = pd.DataFrame(curve_data, index=pd.Index(tenor_labels, name="만기"))
-                curve_styled = (
-                    curve_table.style
+                ktb_curve_table = pd.DataFrame(
+                    ktb_curve_data,
+                    index=pd.Index(ktb_tenor_labels, name="만기"),
+                )
+                ktb_styled = (
+                    ktb_curve_table.style
                     .format({"현재(%)": "{:.3f}", "1W(bp)": "{:.1f}", "1M(bp)": "{:.1f}"}, na_rep="-")
                     .map(_color_bp, subset=["1W(bp)", "1M(bp)"])
                     .set_properties(**{"text-align": "center"})
                 )
-                st.dataframe(curve_styled, use_container_width=True)
+                st.dataframe(ktb_styled, use_container_width=True)
 
-        # ── 국내 채권 금리 ───────────────────────────────────────────────────
-        elif analysis_sub == "국내 채권 금리":
+    # ── 장외거래 대표수익률 ──────────────────────────────────────────────────
+    with tab_otc:
+        st.caption(
+            f"Source: KOFIA  ·  기준일: {TODAY_STR}  ·  "
+            "최종호가수익률 vs. 장외거래대표수익률  ·  스프레드 = 최종호가 − 장외거래"
+        )
 
-            # ── 채권 금리 ────────────────────────────────────────────────────
-            if domestic_sub == "채권 금리":
-                st.caption(
-                    f"Source: KOFIA  ·  기준일: {TODAY_STR}  ·  "
-                    "주말·공휴일은 직전 거래일 값으로 채워짐"
+        if _bond_df is None or _otc_df is None:
+            st.error(
+                "국내 채권 금리 또는 장외거래대표수익률 데이터가 없습니다.  \n"
+                "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
+            )
+        else:
+            common_cols = [c for c in _otc_df.columns if c in _bond_df.columns]
+            if not common_cols:
+                st.warning("비교 가능한 공통 종목이 없습니다.")
+            else:
+                today_bond = TreasuryCalc.get_ref_value(_bond_df, TODAY)
+                today_otc  = TreasuryCalc.get_ref_value(_otc_df,  TODAY)
+
+                # ── 시그널 계산 (5Y 통계 기반 Z-score) ────────────────
+                _bond_al, _otc_al = _bond_df[common_cols].align(
+                    _otc_df[common_cols], join="inner"
                 )
+                spread_ts = (_bond_al - _otc_al) * 100  # bp 시계열
+                mean_5y   = spread_ts.mean()
+                std_5y    = spread_ts.std()
 
-                if _bond_df is None:
-                    st.error(
-                        "데이터 파일이 없습니다.  \n"
-                        "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
-                    )
+                _avail_idx = spread_ts.index[spread_ts.index <= pd.Timestamp(TODAY)]
+                if len(_avail_idx) > 0:
+                    today_spread_row = spread_ts.loc[_avail_idx[-1]]
                 else:
-                    st.subheader("국내 채권 금리 동향")
-                    st.caption("단위: 금리 (%), 변화 bp (0.01%p)")
+                    today_spread_row = pd.Series(float("nan"), index=common_cols)
 
-                    bond_summary_df = _build_bond_summary(_bond_df, TARGET_DATE)
-                    bond_format = {
-                        "금리 (%)": "{:.3f}", "1D": "{:.1f}", "1W": "{:.1f}",
-                        "MTD": "{:.1f}", "YTD": "{:.1f}", "YoY": "{:.1f}",
+                z_scores = (today_spread_row - mean_5y) / std_5y
+
+                def _get_signal(z) -> str:
+                    if pd.isna(z):        return "Normal"
+                    if abs(z) >= 2.0:     return "Warning"
+                    if abs(z) >= 1.5:     return "Caution"
+                    return "Normal"
+
+                signal_map = {col: _get_signal(z_scores[col]) for col in common_cols}
+
+                n_warning = sum(1 for s in signal_map.values() if s == "Warning")
+                n_caution = sum(1 for s in signal_map.values() if s == "Caution")
+                n_normal  = len(common_cols) - n_warning - n_caution
+
+                # ── 요약 배너 ──────────────────────────────────────────
+                st.subheader("스프레드 이상 시그널")
+                st.caption("5Y 전체 기간 평균·표준편차 기준  ·  |Z| ≥ 1.5σ: Caution  ·  |Z| ≥ 2.0σ: Warning")
+
+                col_w, col_c, col_n = st.columns(3)
+                col_w.metric("🚨 Warning", f"{n_warning}종목")
+                col_c.metric("⚡ Caution", f"{n_caution}종목")
+                col_n.metric("✅ 정상",    f"{n_normal}종목")
+
+                # ── 시그널 종목 상세 테이블 ────────────────────────────
+                _SIG_WARNING_BG = "background-color: rgba(255, 75, 75, 0.18)"
+                _SIG_CAUTION_BG = "background-color: rgba(255, 165, 0, 0.18)"
+
+                def _fmt_signal(val):
+                    if val == "Warning": return "🚨 Warning"
+                    if val == "Caution": return "⚡ Caution"
+                    return val
+
+                signal_rows: dict = {}
+                for col in common_cols:
+                    sig = signal_map[col]
+                    if sig == "Normal":
+                        continue
+                    label = BOND_LABELS.get(col, col)
+                    z     = z_scores[col]
+                    signal_rows[label] = {
+                        "현재(bp)":       today_spread_row[col] if pd.notna(today_spread_row[col]) else float("nan"),
+                        "5Y평균(bp)":     mean_5y[col],
+                        "5Y표준편차(bp)": std_5y[col],
+                        "Z-score":        z,
+                        "시그널":         sig,
                     }
-                    bp_cols_bond = [c for c in bond_summary_df.columns if c != "금리 (%)"]
-                    bond_styled = (
-                        bond_summary_df.style
-                        .format(bond_format, na_rep="-")
-                        .map(_color_bp, subset=bp_cols_bond)
+
+                if signal_rows:
+                    sig_df = pd.DataFrame.from_dict(signal_rows, orient="index")
+                    sig_df.index.name = "종목"
+
+                    def _row_signal_style(row):
+                        sig = row["시그널"]
+                        if sig == "Warning": bg = _SIG_WARNING_BG
+                        elif sig == "Caution": bg = _SIG_CAUTION_BG
+                        else: bg = ""
+                        return [bg] * len(row)
+
+                    sig_styled = (
+                        sig_df.style
+                        .apply(_row_signal_style, axis=1)
+                        .format({
+                            "현재(bp)":       "{:+.3f}",
+                            "5Y평균(bp)":     "{:+.3f}",
+                            "5Y표준편차(bp)": "{:.3f}",
+                            "Z-score":        "{:+.2f}",
+                        }, na_rep="-")
+                        .format({"시그널": _fmt_signal})
                         .set_properties(**{"text-align": "center"})
                     )
-                    st.dataframe(bond_styled, use_container_width=True)
-
-                    st.divider()
-
-                    ktb_avail = [t for t in KTB_TENORS if f"KTB_{t}Y" in _bond_df.columns]
-                    if ktb_avail:
-                        st.subheader("국내 채권 Yield Curve")
-                        ktb_tenor_labels = [f"{t}Y" for t in ktb_avail]
-                        ktb_cols         = [f"KTB_{t}Y" for t in ktb_avail]
-
-                        def _ktb_curve_at(ref_date) -> pd.Series:
-                            avail_idx = _bond_df.index[_bond_df.index <= pd.Timestamp(ref_date)]
-                            if len(avail_idx) == 0:
-                                return pd.Series(float("nan"), index=ktb_avail, dtype=float)
-                            row = _bond_df.loc[avail_idx[-1], ktb_cols]
-                            return pd.Series(row.values, index=ktb_avail, dtype=float)
-
-                        today_ktb = _ktb_curve_at(TODAY)
-                        week_ktb  = _ktb_curve_at(TODAY - timedelta(days=7))
-                        month_ktb = _ktb_curve_at(TODAY - timedelta(days=30))
-
-                        fig_ktb = go.Figure()
-                        if not today_ktb.dropna().empty:
-                            fig_ktb.add_trace(go.Scatter(
-                                x=ktb_tenor_labels, y=today_ktb.values,
-                                mode="lines+markers", name=f"현재 ({TODAY_STR})",
-                                line=dict(width=2.5),
-                            ))
-                        if not week_ktb.dropna().empty:
-                            fig_ktb.add_trace(go.Scatter(
-                                x=ktb_tenor_labels, y=week_ktb.values,
-                                mode="lines+markers", name="1주 전",
-                                line=dict(dash="dot", width=1.5), opacity=0.8,
-                            ))
-                        if not month_ktb.dropna().empty:
-                            fig_ktb.add_trace(go.Scatter(
-                                x=ktb_tenor_labels, y=month_ktb.values,
-                                mode="lines+markers", name="1개월 전",
-                                line=dict(dash="dash", width=1.5), opacity=0.8,
-                            ))
-                        fig_ktb.update_layout(
-                            title="국고채 금리 커브",
-                            xaxis_title="만기", yaxis_title="수익률 (%)",
-                            hovermode="x unified",
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        )
-                        st.plotly_chart(fig_ktb, use_container_width=True)
-
-                        ktb_curve_data = {
-                            "현재(%)": today_ktb.values,
-                            "1W(bp)":  (today_ktb - week_ktb).values * 100,
-                            "1M(bp)":  (today_ktb - month_ktb).values * 100,
-                        }
-                        ktb_curve_table = pd.DataFrame(
-                            ktb_curve_data,
-                            index=pd.Index(ktb_tenor_labels, name="만기"),
-                        )
-                        ktb_styled = (
-                            ktb_curve_table.style
-                            .format({"현재(%)": "{:.3f}", "1W(bp)": "{:.1f}", "1M(bp)": "{:.1f}"}, na_rep="-")
-                            .map(_color_bp, subset=["1W(bp)", "1M(bp)"])
-                            .set_properties(**{"text-align": "center"})
-                        )
-                        st.dataframe(ktb_styled, use_container_width=True)
-
-            # ── 장외거래 대표수익률 ──────────────────────────────────────────
-            elif domestic_sub == "장외거래 대표수익률":
-                st.caption(
-                    f"Source: KOFIA  ·  기준일: {TODAY_STR}  ·  "
-                    "최종호가수익률 vs. 장외거래대표수익률  ·  스프레드 = 최종호가 − 장외거래"
-                )
-
-                if _bond_df is None or _otc_df is None:
-                    st.error(
-                        "국내 채권 금리 또는 장외거래대표수익률 데이터가 없습니다.  \n"
-                        "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
-                    )
+                    st.dataframe(sig_styled, use_container_width=True)
                 else:
-                    common_cols = [c for c in _otc_df.columns if c in _bond_df.columns]
-                    if not common_cols:
-                        st.warning("비교 가능한 공통 종목이 없습니다.")
-                    else:
-                        today_bond = TreasuryCalc.get_ref_value(_bond_df, TODAY)
-                        today_otc  = TreasuryCalc.get_ref_value(_otc_df,  TODAY)
+                    st.success("현재 모든 종목의 스프레드가 정상 범위 내에 있습니다.")
 
-                        # ── 시그널 계산 (5Y 통계 기반 Z-score) ────────────────
-                        _bond_al, _otc_al = _bond_df[common_cols].align(
-                            _otc_df[common_cols], join="inner"
-                        )
-                        spread_ts = (_bond_al - _otc_al) * 100  # bp 시계열
-                        mean_5y   = spread_ts.mean()
-                        std_5y    = spread_ts.std()
+                st.divider()
 
-                        _avail_idx = spread_ts.index[spread_ts.index <= pd.Timestamp(TODAY)]
-                        if len(_avail_idx) > 0:
-                            today_spread_row = spread_ts.loc[_avail_idx[-1]]
-                        else:
-                            today_spread_row = pd.Series(float("nan"), index=common_cols)
+                # ── 전체 스프레드 비교 테이블 ──────────────────────────
+                st.subheader("최종호가 vs. 장외거래 상세")
+                rows: dict = {}
+                for col in common_cols:
+                    label    = BOND_LABELS.get(col, col)
+                    bond_val = today_bond[col] if col in today_bond.index else float("nan")
+                    otc_val  = today_otc[col]  if col in today_otc.index  else float("nan")
+                    spread   = (bond_val - otc_val) * 100 if pd.notna(bond_val) and pd.notna(otc_val) else float("nan")
+                    rows[label] = {
+                        "최종호가(%)":   bond_val,
+                        "장외거래(%)":   otc_val,
+                        "스프레드(bp)": spread,
+                        "시그널":       signal_map[col],
+                    }
 
-                        z_scores = (today_spread_row - mean_5y) / std_5y
+                otc_cmp_df = pd.DataFrame.from_dict(rows, orient="index")
+                otc_cmp_df.index.name = "종목"
 
-                        def _get_signal(z) -> str:
-                            if pd.isna(z):        return "Normal"
-                            if abs(z) >= 2.0:     return "Warning"
-                            if abs(z) >= 1.5:     return "Caution"
-                            return "Normal"
+                def _row_signal_style_full(row):
+                    sig = row["시그널"]
+                    if sig == "Warning": bg = _SIG_WARNING_BG
+                    elif sig == "Caution": bg = _SIG_CAUTION_BG
+                    else: bg = ""
+                    return [bg] * len(row)
 
-                        signal_map = {col: _get_signal(z_scores[col]) for col in common_cols}
-
-                        n_warning = sum(1 for s in signal_map.values() if s == "Warning")
-                        n_caution = sum(1 for s in signal_map.values() if s == "Caution")
-                        n_normal  = len(common_cols) - n_warning - n_caution
-
-                        # ── 요약 배너 ──────────────────────────────────────────
-                        st.subheader("스프레드 이상 시그널")
-                        st.caption("5Y 전체 기간 평균·표준편차 기준  ·  |Z| ≥ 1.5σ: Caution  ·  |Z| ≥ 2.0σ: Warning")
-
-                        col_w, col_c, col_n = st.columns(3)
-                        col_w.metric("🚨 Warning", f"{n_warning}종목")
-                        col_c.metric("⚡ Caution", f"{n_caution}종목")
-                        col_n.metric("✅ 정상",    f"{n_normal}종목")
-
-                        # ── 시그널 종목 상세 테이블 ────────────────────────────
-                        signal_rows: dict = {}
-                        for col in common_cols:
-                            sig = signal_map[col]
-                            if sig == "Normal":
-                                continue
-                            label = BOND_LABELS.get(col, col)
-                            z     = z_scores[col]
-                            signal_rows[label] = {
-                                "현재(bp)":  today_spread_row[col] if pd.notna(today_spread_row[col]) else float("nan"),
-                                "5Y평균(bp)": mean_5y[col],
-                                "5Y표준편차(bp)": std_5y[col],
-                                "Z-score":   z,
-                                "시그널":    sig,
-                            }
-
-                        _SIG_WARNING_BG = "background-color: rgba(255, 75, 75, 0.18)"
-                        _SIG_CAUTION_BG = "background-color: rgba(255, 165, 0, 0.18)"
-
-                        def _fmt_signal(val):
-                            if val == "Warning": return "🚨 Warning"
-                            if val == "Caution": return "⚡ Caution"
-                            return val
-
-                        if signal_rows:
-                            sig_df = pd.DataFrame.from_dict(signal_rows, orient="index")
-                            sig_df.index.name = "종목"
-
-                            def _row_signal_style(row):
-                                sig = row["시그널"]
-                                if sig == "Warning": bg = _SIG_WARNING_BG
-                                elif sig == "Caution": bg = _SIG_CAUTION_BG
-                                else: bg = ""
-                                return [bg] * len(row)
-
-                            sig_styled = (
-                                sig_df.style
-                                .apply(_row_signal_style, axis=1)
-                                .format({
-                                    "현재(bp)":       "{:+.1f}",
-                                    "5Y평균(bp)":     "{:+.1f}",
-                                    "5Y표준편차(bp)": "{:.1f}",
-                                    "Z-score":        "{:+.2f}",
-                                }, na_rep="-")
-                                .format({"시그널": _fmt_signal})
-                                .set_properties(**{"text-align": "center"})
-                            )
-                            st.dataframe(sig_styled, use_container_width=True)
-                        else:
-                            st.success("현재 모든 종목의 스프레드가 정상 범위 내에 있습니다.")
-
-                        st.divider()
-
-                        # ── 전체 스프레드 비교 테이블 ──────────────────────────
-                        st.subheader("최종호가 vs. 장외거래 상세")
-                        rows: dict = {}
-                        for col in common_cols:
-                            label    = BOND_LABELS.get(col, col)
-                            bond_val = today_bond[col] if col in today_bond.index else float("nan")
-                            otc_val  = today_otc[col]  if col in today_otc.index  else float("nan")
-                            spread   = (bond_val - otc_val) * 100 if pd.notna(bond_val) and pd.notna(otc_val) else float("nan")
-                            rows[label] = {
-                                "최종호가(%)":   bond_val,
-                                "장외거래(%)":   otc_val,
-                                "스프레드(bp)": spread,
-                                "시그널":       signal_map[col],
-                            }
-
-                        otc_cmp_df = pd.DataFrame.from_dict(rows, orient="index")
-                        otc_cmp_df.index.name = "종목"
-
-                        def _row_signal_style_full(row):
-                            sig = row["시그널"]
-                            if sig == "Warning": bg = _SIG_WARNING_BG
-                            elif sig == "Caution": bg = _SIG_CAUTION_BG
-                            else: bg = ""
-                            return [bg] * len(row)
-
-                        otc_cmp_styled = (
-                            otc_cmp_df.style
-                            .apply(_row_signal_style_full, axis=1)
-                            .format({
-                                "최종호가(%)":  "{:.3f}",
-                                "장외거래(%)":  "{:.3f}",
-                                "스프레드(bp)": "{:.1f}",
-                            }, na_rep="-")
-                            .format({"시그널": _fmt_signal})
-                            .map(_color_bp, subset=["스프레드(bp)"])
-                            .set_properties(**{"text-align": "center"})
-                        )
-                        st.dataframe(otc_cmp_styled, use_container_width=True)
+                otc_cmp_styled = (
+                    otc_cmp_df.style
+                    .apply(_row_signal_style_full, axis=1)
+                    .format({
+                        "최종호가(%)":  "{:.3f}",
+                        "장외거래(%)":  "{:.3f}",
+                        "스프레드(bp)": "{:.3f}",
+                    }, na_rep="-")
+                    .format({"시그널": _fmt_signal})
+                    .map(_color_bp, subset=["스프레드(bp)"])
+                    .set_properties(**{"text-align": "center"})
+                )
+                st.dataframe(otc_cmp_styled, use_container_width=True)
 
     # ── Raw Data ─────────────────────────────────────────────────────────────
-    elif bond_view == "Raw Data":
+    with tab_raw:
+        raw1, raw2, raw3 = st.tabs(["글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률"])
 
         # ── 글로벌 국채 금리 raw ─────────────────────────────────────────────
-        if raw_sub == "글로벌 국채 금리":
+        with raw1:
             st.caption(
                 "글로벌 국채 금리 + KOFIA KR 금리 병합  ·  "
                 "주말·공휴일은 직전 거래일 값으로 채워짐 (forward fill)"
@@ -624,7 +565,7 @@ if asset_class == "채권":
                 )
 
         # ── 국내 채권 금리 raw ───────────────────────────────────────────────
-        elif raw_sub == "국내 채권 금리":
+        with raw2:
             st.caption(
                 "KOFIA 전종목 최종호가수익률  ·  "
                 "주말·공휴일은 직전 거래일 값으로 채워짐 (forward fill)"
@@ -665,7 +606,7 @@ if asset_class == "채권":
                 )
 
         # ── 장외 거래 대표수익률 raw ─────────────────────────────────────────
-        elif raw_sub == "장외 거래 대표수익률":
+        with raw3:
             st.caption(
                 "KOFIA 장외거래대표수익률  ·  "
                 "주말·공휴일은 직전 거래일 값으로 채워짐 (forward fill)"
