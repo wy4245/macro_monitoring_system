@@ -145,6 +145,21 @@ def _gt_gap_countries(conn, ref_date: date, max_lag_days: int = 5) -> list[str]:
     return gap_countries
 
 
+def _export_individual_bonds_parquet(conn, years: list[int]) -> None:
+    """DuckDB individual_bonds 테이블에서 지정 연도를 data/individual_bonds/{year}.parquet으로 내보냅니다."""
+    ib_dir = GIT_DIR / "individual_bonds"
+    ib_dir.mkdir(exist_ok=True)
+    for year in years:
+        df = conn.execute(
+            f"SELECT * FROM individual_bonds WHERE YEAR(Date) = {year} ORDER BY Date"
+        ).df()
+        if df.empty:
+            continue
+        out = ib_dir / f"{year}.parquet"
+        df.to_parquet(out, index=False)
+        print(f"  [export] → individual_bonds/{year}.parquet  ({len(df)}행, {out.stat().st_size // 1024} KB)")
+
+
 def _export_parquet(conn, table: str) -> None:
     """DuckDB 테이블에서 최근 EXPORT_YEARS년치를 data/{table}.parquet으로 내보냅니다."""
     try:
@@ -400,6 +415,16 @@ print(f"  기간: {ib_start_str} ~ {end_str}")
 
 if ib_start_dt > end_date:
     print("  [완료] 이미 최신 데이터")
+    # parquet 파일이 없는 연도가 있으면 재생성
+    ib_dir = GIT_DIR / "individual_bonds"
+    years_in_db = [
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT YEAR(Date) FROM individual_bonds ORDER BY 1"
+        ).fetchall()
+    ]
+    missing_years = [y for y in years_in_db if not (ib_dir / f"{y}.parquet").exists()]
+    if missing_years:
+        _export_individual_bonds_parquet(conn, missing_years)
 else:
     df_ib = individual_bond().collect(start_date=ib_start_str, end_date=end_str)
     if df_ib is not None:
@@ -428,6 +453,10 @@ else:
 
         rows = conn.execute("SELECT COUNT(*) FROM individual_bonds").fetchone()[0]
         print(f"  [저장] DuckDB individual_bonds  (총 {rows}행)")
+
+        # 수집된 연도의 parquet 갱신
+        new_years = sorted(df_ib["Date"].dt.year.unique().tolist())
+        _export_individual_bonds_parquet(conn, new_years)
     else:
         print("  [실패] 기존 데이터 유지")
 
