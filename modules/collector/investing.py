@@ -9,8 +9,8 @@ GlobalTreasury : 글로벌 주요국 국채 금리 (Playwright Chromium)
 
 구현 방식:
   1. Playwright Chromium headless → Cloudflare 우회 (실제 브라우저 실행)
-  2. __NEXT_DATA__ > props.pageProps.state.bondStore.instrumentId 에서 pair_id 추출
-  3. page.evaluate() fetch POST /instruments/HistoricalDataAjax → HTML 테이블 파싱
+  2. __NEXT_DATA__ > props.pageProps.state.historicalDataStore.historicalData.data 에서 데이터 추출 (주 방법)
+  3. 위 방법이 날짜 범위 미포함 시 page.evaluate() fetch POST /instruments/HistoricalDataAjax 로 AJAX 직접 호출
 """
 
 import re
@@ -90,6 +90,8 @@ class GlobalTreasury:
 
     def __init__(self) -> None:
         self._pair_id_cache: dict[str, int] = {}
+        self._history_cache: dict[str, str] = {}   # slug -> 인터셉트된 AJAX HTML (레거시)
+        self._nd_data_cache: dict[str, list] = {}  # slug -> __NEXT_DATA__ historicalData.data
         self._pw      = None
         self._browser = None
         self._ctx     = None
@@ -133,23 +135,48 @@ class GlobalTreasury:
             return self._pair_id_cache[slug]
 
         url = f"{self.INVESTING_BASE}/{slug}-historical-data"
+
+        # 페이지가 자체적으로 보내는 HistoricalDataAjax 응답을 가로채서 캐시 (레거시 폴백용)
+        captured_ajax: list[str] = []
+
+        def _on_response(response: object) -> None:
+            if "HistoricalDataAjax" in response.url:
+                try:
+                    captured_ajax.append(response.text())
+                except Exception:
+                    pass
+
+        self._page.on("response", _on_response)
         try:
-            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             if resp and resp.status == 404:
                 return None
-            # Cloudflare JS 챌린지 처리 대기 (충분한 시간 확보)
-            self._page.wait_for_timeout(5_000)
+            # Cloudflare JS 챌린지 + 페이지 로드 완료 대기
+            self._page.wait_for_timeout(10_000)
         except Exception as e:
             print(f"    [경고] 페이지 접근 실패 ({slug}): {e}")
             return None
+        finally:
+            self._page.remove_listener("response", _on_response)
+
+        if captured_ajax:
+            self._history_cache[slug] = captured_ajax[-1]
 
         html = self._page.content()
+
+        # __NEXT_DATA__에서 historicalData 직접 추출 (주 방법)
+        nd_data = self._extract_nd_history(html)
+        if nd_data:
+            self._nd_data_cache[slug] = nd_data
+            print(f"    [정보] __NEXT_DATA__에서 {len(nd_data)}개 데이터 포인트 추출")
+        else:
+            print(f"    [경고] __NEXT_DATA__ 히스토리 미발견 ({slug})")
+
         pair_id = self._extract_pair_id(html)
         if pair_id:
             self._pair_id_cache[slug] = pair_id
         else:
             print(f"    [경고] pair_id 미발견 ({slug})")
-            # 첫 번째 실패 시 HTML 저장 (원인 파악용)
             if not self._debug_html_saved:
                 self._debug_html_saved = True
                 debug_path = _root / "data" / "debug_investing.html"
@@ -188,6 +215,26 @@ class GlobalTreasury:
         return None
 
     @staticmethod
+    def _extract_nd_history(html: str) -> list | None:
+        """__NEXT_DATA__.historicalDataStore.historicalData.data 추출."""
+        m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
+        if not m:
+            return None
+        try:
+            nd = json.loads(m.group(1))
+            data = (
+                nd.get("props", {})
+                  .get("pageProps", {})
+                  .get("state", {})
+                  .get("historicalDataStore", {})
+                  .get("historicalData", {})
+                  .get("data", [])
+            )
+            return data if data else None
+        except Exception:
+            return None
+
+    @staticmethod
     def _search_in_json(obj: object, _depth: int = 0) -> int | None:
         if _depth > 12:
             return None
@@ -215,77 +262,140 @@ class GlobalTreasury:
     # ── 시계열 조회 ───────────────────────────────────────────────────────────
 
     def _fetch_history(self, pair_id: int, slug: str, start_date: str, end_date: str) -> pd.Series | None:
-        st = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
-        en = datetime.strptime(end_date,   "%Y-%m-%d").strftime("%m/%d/%Y")
+        """
+        우선순위:
+          1. __NEXT_DATA__ 캐시 (사이트가 페이지에 직접 내장한 데이터)
+          2. 응답 인터셉트 캐시 HTML (레거시, 사이트가 AJAX 발행할 때만 동작)
+          3. page.evaluate()로 HistoricalDataAjax 직접 POST (더 긴 날짜 범위 필요 시)
+        """
+        start = pd.to_datetime(start_date)
+        end   = pd.to_datetime(end_date)
 
-        form_data = {
-            "curr_id":     str(pair_id),
-            "smlID":       "",
-            "st_date":     st,
-            "end_date":    en,
-            "interval_sec": "Daily",
-            "sort_col":    "date",
-            "sort_ord":    "ASC",
-            "action":      "historical_data",
-        }
-        referer = f"{self.INVESTING_BASE}/{slug}-historical-data"
+        # 1순위: __NEXT_DATA__ 캐시
+        nd_data = self._nd_data_cache.get(slug)
+        if nd_data:
+            series = self._parse_nd_series(nd_data, start, end)
+            if series is not None and not series.empty:
+                return series
+            print(f"    [경고] __NEXT_DATA__ 데이터가 요청 기간({start_date}~{end_date}) 미포함, AJAX 시도")
 
+        # 2순위: 인터셉트된 AJAX 캐시 (레거시)
+        html_text = self._history_cache.get(slug)
+        if html_text:
+            series = self._parse_ajax_html(html_text, start, end)
+            if series is not None and not series.empty:
+                return series
+
+        # 3순위: page.evaluate()로 HistoricalDataAjax 직접 POST
+        if self._page and pair_id:
+            series = self._fetch_via_ajax(pair_id, slug, start_date, end_date)
+            if series is not None and not series.empty:
+                return series
+
+        print(f"    [경고] 모든 데이터 취득 방법 실패 ({slug})")
+        return None
+
+    @staticmethod
+    def _parse_nd_series(data: list, start, end) -> pd.Series | None:
+        """__NEXT_DATA__ historicalData.data 리스트를 pd.Series로 변환."""
+        rows = []
+        for item in data:
+            try:
+                ts = item.get("rowDateTimestamp") or item.get("rowDate")
+                # last_closeRaw가 더 정밀한 값 (소수점 포함 문자열)
+                price_raw = item.get("last_closeRaw") or item.get("last_close")
+                if ts and price_raw is not None:
+                    dt = pd.to_datetime(ts, utc=True).tz_localize(None)
+                    price = float(price_raw)
+                    if price != 0:
+                        rows.append((dt, price))
+            except Exception:
+                continue
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=["Date", "Price"])
+        df = df.sort_values("Date")
+        df = df[(df["Date"] >= start) & (df["Date"] <= end)]
+        if df.empty:
+            return None
+        return pd.Series(df["Price"].values, index=df["Date"].dt.date, dtype=float)
+
+    @staticmethod
+    def _parse_ajax_html(html_text: str, start, end) -> pd.Series | None:
+        """HistoricalDataAjax HTML 테이블을 pd.Series로 변환."""
         try:
-            # 브라우저 컨텍스트 내 fetch 실행 → Cloudflare 쿠키 자동 포함
-            html_text: str = self._page.evaluate(
-                """
-                async ([url, data, referer]) => {
-                    const resp = await fetch(url, {
-                        method: 'POST',
-                        headers: {
-                            'X-Requested-With': 'XMLHttpRequest',
-                            'Accept': 'text/plain, */*; q=0.01',
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'Referer': referer,
-                        },
-                        body: new URLSearchParams(data).toString(),
-                    });
-                    return resp.text();
-                }
-                """,
-                [self.HIST_AJAX_URL, form_data, referer],
-            )
-            if not html_text:
-                return None
-            dfs = pd.read_html(StringIO(html_text))
+            dfs = pd.read_html(StringIO(html_text), flavor="lxml")
             if not dfs:
                 return None
             df = dfs[0]
             if "Date" not in df.columns or "Price" not in df.columns:
                 return None
-            df["Date"]  = pd.to_datetime(df["Date"])
+            df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
             df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
             df = df.dropna(subset=["Date", "Price"]).sort_values("Date", ascending=True)
+            df = df[(df["Date"] >= start) & (df["Date"] <= end)]
+            if df.empty:
+                return None
             return pd.Series(df["Price"].values, index=df["Date"].dt.date, dtype=float)
         except Exception as e:
-            print(f"    [경고] 데이터 조회 오류 (pair_id={pair_id}): {e}")
+            print(f"    [경고] AJAX HTML 파싱 오류: {e}")
+            return None
+
+    def _fetch_via_ajax(self, pair_id: int, slug: str, start_date: str, end_date: str) -> pd.Series | None:
+        """page.evaluate()로 HistoricalDataAjax에 직접 POST 요청 (더 긴 날짜 범위용)."""
+        try:
+            start_fmt = pd.to_datetime(start_date).strftime("%m/%d/%Y")
+            end_fmt   = pd.to_datetime(end_date).strftime("%m/%d/%Y")
+
+            js = """async (args) => {
+                const resp = await fetch('/instruments/HistoricalDataAjax', {
+                    method: 'POST',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `curr_id=${args.pair_id}&st_date=${args.st}&end_date=${args.end}&action=historical_data`,
+                });
+                return await resp.text();
+            }"""
+
+            html_text = self._page.evaluate(js, {"pair_id": pair_id, "st": start_fmt, "end": end_fmt})
+            if not html_text:
+                return None
+
+            start = pd.to_datetime(start_date)
+            end   = pd.to_datetime(end_date)
+            series = self._parse_ajax_html(html_text, start, end)
+            if series is not None:
+                print(f"    [정보] AJAX 직접 POST로 {len(series)}개 데이터 취득")
+            return series
+        except Exception as e:
+            print(f"    [경고] AJAX 직접 요청 실패 ({slug}): {e}")
             return None
 
     # ── 공개 인터페이스 ───────────────────────────────────────────────────────
 
-    def collect(self, start_date: str, end_date: str) -> pd.DataFrame | None:
+    def collect(self, start_date: str, end_date: str, countries: list[str] | None = None) -> pd.DataFrame | None:
         """
         investing.com에서 글로벌 국채 금리 데이터를 수집합니다.
 
         Args:
             start_date: "YYYY-MM-DD" (포함)
             end_date  : "YYYY-MM-DD" (포함)
+            countries : 수집할 국가 코드 리스트 (예: ["JP", "CN"]). None이면 전체 수집.
 
         Returns:
             Date 인덱스, 컬럼명 "{CC}_{n}Y" 의 pd.DataFrame. 실패 시 None.
         """
+        slugs = {cc: m for cc, m in self.BOND_SLUGS.items() if countries is None or cc in countries}
         all_series: dict[str, pd.Series] = {}
-        total = sum(len(m) for m in self.BOND_SLUGS.values())
+        total = sum(len(m) for m in slugs.values())
         done  = 0
 
-        self._start_browser()
-        try:
-            for country, maturities in self.BOND_SLUGS.items():
+        for country, maturities in slugs.items():
+            print(f"  [브라우저 시작] {country}", flush=True)
+            self._start_browser()
+            try:
                 for tenor, slug in maturities.items():
                     done += 1
                     col = f"{country}_{tenor}Y"
@@ -305,8 +415,9 @@ class GlobalTreasury:
                     else:
                         print(f"    → 데이터 없음")
                     time.sleep(0.5)
-        finally:
-            self._stop_browser()
+            finally:
+                self._stop_browser()
+                print(f"  [브라우저 종료] {country}", flush=True)
 
         if not all_series:
             print("  [오류] 수집된 데이터 없음")

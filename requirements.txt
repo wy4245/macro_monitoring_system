@@ -1,5 +1,6 @@
 pandas
 numpy
+duckdb
 openpyxl
 requests
 python-dotenv
@@ -9,5 +10,6 @@ selenium
 webdriver-manager
 playwright
 lxml
+pyarrow
 streamlit>=1.35.0
 plotly

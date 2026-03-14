@@ -4,7 +4,10 @@ __pycache__/
 *.pyc
 .DS_Store
 *.xls
-data/raw/selenium_error_step.html
 data/collect_log.txt
 data/tmp/
+data/*.csv
+data/individual_bonds/
+data/debug_*.html
+data/selenium_error_*.html
 .claude/

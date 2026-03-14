@@ -95,6 +95,7 @@ class TreasuryCalc:
             ("1D",  today - pd.Timedelta(days=1)),
             ("1W",  today - pd.Timedelta(days=7)),
             ("MTD", pd.Timestamp(today.year, today.month, 1) - pd.Timedelta(days=1)),
+            ("MoM", today - pd.DateOffset(months=1)),
             ("YTD", pd.Timestamp(today.year - 1, 12, 31)),
             ("YoY", today - pd.DateOffset(years=1)),
         ]

@@ -3,6 +3,7 @@ KOFIA 데이터 수집기
 
 TreasurySummary : 주요 만기 국채 금리 — 기간별 탭, 5개 시리즈
 BondSummary     : 전종목 최종호가수익률 — 18개 시리즈, 3배치 수집 후 병합
+BondFutures     : 국채선물수익률 — 90일 청크 분할 수집, 채권별 수평 확장
 
 공통 흐름:
   default_content
@@ -19,7 +20,7 @@ import sys
 import time
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 _root = Path(__file__).resolve().parents[2]
 if str(_root) not in sys.path:
@@ -116,10 +117,23 @@ def _wait_for_download(save_dir: str, cwd: str, timeout: int = 30, filename: str
 
 
 def _parse_kofia_xls(file_path: str) -> pd.DataFrame | None:
-    """KOFIA .xls(HTML 테이블) 파일 → Date 컬럼 표준화된 DataFrame."""
+    """KOFIA .xls(HTML 테이블) 파일 → Date 컬럼 표준화된 DataFrame.
+
+    파일을 바이트로 읽어 EUC-KR 디코딩 후 파싱합니다.
+    (pd.read_html의 encoding 파라미터는 로컬 파일에서 동작하지 않음)
+    """
+    from io import StringIO
+
     try:
+        with open(file_path, "rb") as f:
+            raw = f.read()
         try:
-            dfs = pd.read_html(file_path, flavor="lxml")
+            text = raw.decode("euc-kr")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+
+        try:
+            dfs = pd.read_html(StringIO(text), flavor="lxml")
             df  = dfs[0]
         except Exception:
             df = pd.read_excel(file_path)
@@ -625,11 +639,443 @@ class BondSummary_OTC:
         return merged
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Class 4: BondFutures
+# ══════════════════════════════════════════════════════════════════════════════
+
+_FUTURES_CHUNK_DAYS = 90  # 3개월 단위 조회 제한
+
+
+def _wait_for_new_download(save_dir: str, before_files: set, timeout: int = 30) -> str | None:
+    """다운로드 전/후 파일 목록 비교로 새로 생긴 파일을 반환."""
+    for _ in range(timeout):
+        current = set(os.listdir(save_dir))
+        new_files = {
+            f for f in current - before_files
+            if not f.endswith(".crdownload") and not f.endswith(".tmp")
+        }
+        if new_files:
+            return os.path.join(save_dir, sorted(new_files)[0])
+        time.sleep(1)
+    return None
+
+
+class BondFutures:
+    """
+    KOFIA 국채선물수익률 수집.
+
+    - 3개월(90일) 단위 청크로 조회 분할 수집
+    - 같은 채권명 컬럼 → 수직(row) 병합
+    - 신규 채권명 컬럼 → 수평(column) 확장, 과거 채권이 왼쪽
+    - 반환: Date 컬럼 + 채권명 컬럼들의 DataFrame (저장은 collect_data.py 에서 처리)
+
+    내비게이션 순서:
+      fraAMAKMain → genLv1_0_imgLv1 (채권금리)
+                  → leftGenLv1_3_leftTxtLv1 (국채선물수익률)
+      maincontent → tabContents1_tab_tabs2 (기간별 탭)
+      tabContents1_contents_tabs2_body
+        → schStandardDt_input / schUstandardDt_input (날짜)
+        → image3 (조회) → image4 (엑셀 다운로드)
+    """
+
+    def __init__(self, download_dir: str | None = None):
+        if download_dir is None:
+            self.download_dir = os.path.abspath(os.path.join(os.getcwd(), "data"))
+        else:
+            self.download_dir = os.path.abspath(download_dir)
+        self._tmp_dir = os.path.join(self.download_dir, "tmp")
+        os.makedirs(self._tmp_dir, exist_ok=True)
+
+    @staticmethod
+    def _date_chunks(start: date, end: date):
+        """start ~ end 를 90일 단위 (chunk_start, chunk_end) 쌍으로 분할."""
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=89), end)
+            yield chunk_start, chunk_end
+            chunk_start = chunk_end + timedelta(days=1)
+
+    def collect(self, start_date: str, end_date: str, headless: bool = True) -> pd.DataFrame | None:
+        """
+        90일 단위 청크로 분할 수집 후 병합하여 반환합니다.
+
+        Args:
+            start_date: "YYYY-MM-DD"
+            end_date  : "YYYY-MM-DD"
+            headless  : True이면 브라우저 창 없이 실행
+
+        Returns:
+            Date 컬럼 + 채권명 컬럼들의 DataFrame. 실패 시 None.
+            열 순서: 과거 채권(첫 출현)이 왼쪽, 최신 채권이 오른쪽.
+        """
+        start  = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end    = datetime.strptime(end_date,   "%Y-%m-%d").date()
+        chunks = list(self._date_chunks(start, end))
+
+        print(f"  기간: {start_date} ~ {end_date}  ({len(chunks)}개 청크)")
+
+        chromedriver_path = ChromeDriverManager().install()
+        chunk_dfs: list[pd.DataFrame] = []
+        seen_cols: list[str] = []   # 첫 출현 순서 추적 (오래된 채권 → 왼쪽)
+
+        for i, (cs, ce) in enumerate(chunks):
+            cs_str = cs.strftime("%Y-%m-%d")
+            ce_str = ce.strftime("%Y-%m-%d")
+            print(f"  [청크 {i+1}/{len(chunks)}] {cs_str} ~ {ce_str}", end=" ... ", flush=True)
+
+            driver = webdriver.Chrome(
+                service=Service(chromedriver_path),
+                options=_build_options(headless, self._tmp_dir),
+            )
+            wait = WebDriverWait(driver, 30)
+
+            try:
+                before = set(os.listdir(self._tmp_dir))
+
+                # ── 페이지 진입 ──────────────────────────────────────────────
+                driver.get(_KOFIA_URL)
+                time.sleep(5)
+                driver.switch_to.frame("fraAMAKMain")
+                _safe_click(driver, wait, By.ID, "genLv1_0_imgLv1")
+                time.sleep(1)
+                _safe_click(driver, wait, By.ID, "leftGenLv1_3_leftTxtLv1")
+                time.sleep(3)
+                wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "maincontent")))
+                _safe_click(driver, wait, By.ID, "tabContents1_tab_tabs2")
+                time.sleep(3)
+                wait.until(EC.frame_to_be_available_and_switch_to_it(
+                    (By.ID, "tabContents1_contents_tabs2_body")
+                ))
+
+                # ── 날짜 입력 (선물 페이지 전용 ID) ─────────────────────────
+                s_el = wait.until(EC.presence_of_element_located((By.ID, "schStandardDt_input")))
+                e_el = wait.until(EC.presence_of_element_located((By.ID, "schUstandardDt_input")))
+                driver.execute_script("arguments[0].value = '';", s_el)
+                s_el.send_keys(cs_str)
+                driver.execute_script("arguments[0].value = '';", e_el)
+                e_el.send_keys(ce_str)
+                time.sleep(1)
+
+                # ── 조회 → 엑셀 다운로드 ────────────────────────────────────
+                _safe_click(driver, wait, By.ID, "image3")   # 조회
+                time.sleep(5)
+                _safe_click(driver, wait, By.ID, "image4")   # 엑셀 다운로드
+                time.sleep(5)
+
+                dl = _wait_for_new_download(self._tmp_dir, before)
+                if not dl:
+                    print("다운로드 실패")
+                    continue
+
+                df = _parse_kofia_xls(dl)
+                try:
+                    os.remove(dl)
+                except Exception:
+                    pass
+
+                if df is None or "Date" not in df.columns:
+                    print("파싱 실패")
+                    continue
+
+                # Date → DatetimeIndex
+                df_idx = df.set_index("Date")
+                df_idx.index = pd.to_datetime(df_idx.index)
+                df_idx.index.name = "Date"
+                df_idx = df_idx.apply(pd.to_numeric, errors="coerce")
+
+                # 첫 출현 컬럼 순서 기록
+                for col in df_idx.columns:
+                    if col not in seen_cols:
+                        seen_cols.append(col)
+
+                chunk_dfs.append(df_idx)
+                print(f"{len(df_idx)}행")
+
+            except Exception as e:
+                print(f"오류: {e}")
+                try:
+                    with open(
+                        os.path.join(self.download_dir, f"selenium_error_futures_{i+1}.html"),
+                        "w", encoding="utf-8",
+                    ) as f:
+                        f.write(driver.page_source)
+                except Exception:
+                    pass
+            finally:
+                driver.quit()
+
+        if not chunk_dfs:
+            print("  [실패] 수집된 데이터 없음")
+            return None
+
+        # 청크 병합: axis=0 concat → 같은 채권명은 행으로 합치고, 다른 채권명은 NaN으로 확장
+        merged = pd.concat(chunk_dfs, axis=0)
+        merged = merged[~merged.index.duplicated(keep="last")]
+        merged.sort_index(inplace=True)
+
+        # 열 순서: 첫 출현 순서 유지 (과거 채권이 왼쪽)
+        ordered_cols = [c for c in seen_cols if c in merged.columns]
+        merged = merged[ordered_cols]
+
+        result = merged.reset_index()
+        result["Date"] = pd.to_datetime(result["Date"]).dt.date
+        result = result.sort_values("Date", ascending=True).reset_index(drop=True)
+
+        # 컬럼명 정리: XLS 헤더 줄바꿈(\n) 및 앞뒤 공백 제거
+        result.columns = [c.replace("\n", " ").strip() for c in result.columns]
+
+        print(f"  [완료] 총 {len(result)}행, {len(result.columns)}열")
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Class 5: individual_bond
+# ══════════════════════════════════════════════════════════════════════════════
+
+_INDIVIDUAL_SESSION_DAYS = 100   # Chrome 세션당 최대 처리 일수 (메모리 관리)
+
+
+def _navigate_to_individual_page(driver, wait):
+    """실시간 체결정보 일자별 거래현황 페이지 진입."""
+    driver.get(_KOFIA_URL)
+    time.sleep(5)
+    driver.switch_to.frame("fraAMAKMain")
+    _safe_click(driver, wait, By.ID, "genLv1_3_imgLv1")          # 유통시장
+    time.sleep(1)
+    _safe_click(driver, wait, By.ID, "leftGenLv1_6_leftTxtLv1")  # 실시간 체결정보
+    time.sleep(3)
+    wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "maincontent")))
+    _safe_click(driver, wait, By.ID, "tabContents1_tab_tabs2")   # 일자별 거래현황
+    time.sleep(3)
+    wait.until(EC.frame_to_be_available_and_switch_to_it(
+        (By.ID, "tabContents1_contents_tabs2_body")
+    ))
+
+
+def _parse_individual_xls(file_path: str, trade_date) -> pd.DataFrame | None:
+    """
+    일자별 거래현황 XLS(HTML table) 파일을 파싱합니다.
+    날짜 컬럼이 없으므로 trade_date를 Date 컬럼으로 자동 추가합니다.
+
+    pd.read_html의 encoding 파라미터는 로컬 파일에서 동작하지 않으므로
+    파일을 바이트로 읽어 EUC-KR 디코딩 후 파싱합니다.
+    KOFIA XLS에는 빈 네비게이션 테이블이 앞에 포함될 수 있으므로
+    비어있지 않은 첫 번째 테이블을 선택합니다.
+    """
+    from io import StringIO
+
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read()
+
+        df = None
+
+        # 1차 시도: HTML 테이블 파싱 (KOFIA XLS는 EUC-KR HTML 테이블)
+        try:
+            try:
+                text = raw.decode("euc-kr")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", errors="replace")
+
+            dfs = pd.read_html(StringIO(text), flavor="lxml")
+            # dfs[0]이 빈 네비게이션/헤더 테이블일 수 있으므로 비어있지 않은 첫 테이블 선택
+            for tbl in dfs:
+                if not tbl.empty:
+                    df = tbl
+                    break
+        except ValueError:
+            pass  # HTML 테이블 없음 → pd.read_excel 시도
+
+        # 2차 시도: 실제 Excel 바이너리 형식인 경우
+        if df is None or df.empty:
+            try:
+                df = pd.read_excel(file_path, engine="xlrd")
+            except Exception:
+                try:
+                    df = pd.read_excel(file_path, engine="openpyxl")
+                except Exception:
+                    pass
+
+        if df is None or df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join(str(c) for c in col).strip() for col in df.columns]
+
+        df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
+
+        if df.empty:
+            return None
+
+        df.insert(0, "Date", trade_date)
+        return df
+
+    except ValueError:
+        # pd.read_html: No tables found → 해당일 데이터 없음
+        return None
+    except Exception as e:
+        print(f"  [파싱 오류] {file_path}: {e}")
+        return None
+
+
+class individual_bond:
+    """
+    KOFIA 실시간 체결정보 일자별 거래현황 수집.
+
+    - 조회일을 하루씩 변경하며 수집 (기간 조회 불가)
+    - 주말 자동 스킵
+    - 세션당 최대 100일 처리 후 Chrome 재시작 (메모리 관리)
+    - 반환: Date 컬럼 포함 전체 DataFrame (저장은 collect_data.py 에서 처리)
+
+    내비게이션:
+      fraAMAKMain → genLv1_3_imgLv1 (유통시장)
+                  → leftGenLv1_6_leftTxtLv1 (실시간 체결정보)
+      maincontent → tabContents1_tab_tabs2 (일자별 거래현황 탭)
+      tabContents1_contents_tabs2_body
+        → ipcDt_input (조회일 입력)
+        → image8 (조회) → fimage3 (엑셀 다운로드)
+    """
+
+    def __init__(self, download_dir: str | None = None):
+        if download_dir is None:
+            self.download_dir = os.path.abspath(os.path.join(os.getcwd(), "data"))
+        else:
+            self.download_dir = os.path.abspath(download_dir)
+        self._tmp_dir = os.path.join(self.download_dir, "tmp")
+        os.makedirs(self._tmp_dir, exist_ok=True)
+
+    def collect(self, start_date: str, end_date: str, headless: bool = True) -> pd.DataFrame | None:
+        """
+        start_date ~ end_date 를 하루씩 수집합니다.
+
+        Args:
+            start_date: "YYYY-MM-DD"
+            end_date  : "YYYY-MM-DD"
+            headless  : True이면 브라우저 창 없이 실행
+
+        Returns:
+            Date 컬럼 포함 전체 DataFrame. 실패 시 None.
+        """
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end   = datetime.strptime(end_date,   "%Y-%m-%d").date()
+
+        # 주말 제외한 수집 대상 날짜 목록
+        all_dates = [
+            start + timedelta(days=i)
+            for i in range((end - start).days + 1)
+            if (start + timedelta(days=i)).weekday() < 5   # 0=월 … 4=금
+        ]
+
+        print(f"  기간: {start_date} ~ {end_date}  (평일 {len(all_dates)}일)")
+
+        chromedriver_path = ChromeDriverManager().install()
+        all_dfs: list[pd.DataFrame] = []
+
+        for batch_idx, batch_start in enumerate(range(0, len(all_dates), _INDIVIDUAL_SESSION_DAYS)):
+            batch = all_dates[batch_start : batch_start + _INDIVIDUAL_SESSION_DAYS]
+            print(f"\n  [세션 {batch_idx + 1}] {batch[0]} ~ {batch[-1]}  ({len(batch)}일)")
+
+            driver = webdriver.Chrome(
+                service=Service(chromedriver_path),
+                options=_build_options(headless, self._tmp_dir),
+            )
+            wait = WebDriverWait(driver, 30)
+
+            try:
+                _navigate_to_individual_page(driver, wait)
+
+                for day in batch:
+                    date_str = day.strftime("%Y-%m-%d")
+                    print(f"    {date_str}", end=" ... ", flush=True)
+
+                    before = set(os.listdir(self._tmp_dir))
+                    try:
+                        # 날짜 입력
+                        d_el = wait.until(EC.presence_of_element_located((By.ID, "ipcDt_input")))
+                        driver.execute_script("arguments[0].value = '';", d_el)
+                        d_el.send_keys(date_str)
+                        time.sleep(0.5)
+
+                        # 조회
+                        _safe_click(driver, wait, By.ID, "image8")
+                        time.sleep(5)
+
+                        # 엑셀 다운로드
+                        _safe_click(driver, wait, By.ID, "fimage3")
+                        dl = _wait_for_new_download(self._tmp_dir, before, timeout=15)
+
+                        if not dl:
+                            print("데이터 없음 (공휴일)")
+                            continue
+
+                        df = _parse_individual_xls(dl, day)
+                        try:
+                            os.remove(dl)
+                        except Exception:
+                            pass
+
+                        if df is None or df.empty:
+                            print("빈 데이터")
+                            continue
+
+                        all_dfs.append(df)
+                        print(f"{len(df)}행")
+
+                    except Exception as e:
+                        print(f"오류: {e}")
+                        # 프레임 컨텍스트 복구 시도
+                        try:
+                            driver.switch_to.default_content()
+                            wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "maincontent")))
+                            wait.until(EC.frame_to_be_available_and_switch_to_it(
+                                (By.ID, "tabContents1_contents_tabs2_body")
+                            ))
+                        except Exception:
+                            try:
+                                _navigate_to_individual_page(driver, wait)
+                            except Exception:
+                                pass
+
+            except Exception as e:
+                print(f"  [세션 {batch_idx + 1} 오류] {e}")
+                try:
+                    with open(
+                        os.path.join(self.download_dir, f"selenium_error_individual_{batch_idx + 1}.html"),
+                        "w", encoding="utf-8",
+                    ) as f:
+                        f.write(driver.page_source)
+                except Exception:
+                    pass
+            finally:
+                driver.quit()
+
+        if not all_dfs:
+            print("  [실패] 수집된 데이터 없음")
+            return None
+
+        result = pd.concat(all_dfs, axis=0, ignore_index=True)
+        result["Date"] = pd.to_datetime(result["Date"]).dt.date
+        print(f"\n  [완료] 총 {len(result)}행")
+        return result
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from datetime import date, timedelta
+    import argparse
     from modules.calculator.kofia import KofiaCalc
+
+    parser = argparse.ArgumentParser(description="KOFIA 수집기 단독 테스트")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default="all",
+        choices=["all", "TreasurySummary", "BondSummary", "BondSummary_OTC",
+                 "BondFutures", "individual_bond"],
+        help="테스트할 클래스명 (생략 시 전체 실행)",
+    )
+    args = parser.parse_args()
+    run = args.target  # 편의상 짧은 이름
 
     _end = date.today() - timedelta(days=1)
     try:
@@ -641,16 +1087,54 @@ if __name__ == "__main__":
     except ValueError:
         _start_5y = _end - timedelta(days=365 * 5)
 
-    print(f"=== TreasurySummary | {_start_1y} ~ {_end} ===")
-    ts = TreasurySummary()
-    df = ts.collect(start_date=str(_start_1y), end_date=str(_end))
-    if df is not None:
-        print(KofiaCalc.standardize(df).tail())
+    # ── TreasurySummary ───────────────────────────────────────────────────────
+    if run in ("all", "TreasurySummary"):
+        print(f"=== TreasurySummary | {_start_1y} ~ {_end} ===")
+        ts = TreasurySummary()
+        df = ts.collect(start_date=str(_start_1y), end_date=str(_end))
+        if df is not None:
+            print(KofiaCalc.standardize(df).tail())
+        print()
 
-    print()
-    print(f"=== BondSummary | {_start_5y} ~ {_end} ===")
-    bs = BondSummary()
-    df = bs.collect(start_date=str(_start_5y), end_date=str(_end))
-    if df is not None:
-        print(df.tail())
-        print(f"컬럼: {df.columns.tolist()}")
+    # ── BondSummary ───────────────────────────────────────────────────────────
+    if run in ("all", "BondSummary"):
+        print(f"=== BondSummary | {_start_5y} ~ {_end} ===")
+        bs = BondSummary()
+        df = bs.collect(start_date=str(_start_5y), end_date=str(_end))
+        if df is not None:
+            print(df.tail())
+            print(f"컬럼: {df.columns.tolist()}")
+        print()
+
+    # ── BondSummary_OTC ───────────────────────────────────────────────────────
+    if run in ("all", "BondSummary_OTC"):
+        print(f"=== BondSummary_OTC | {_start_5y} ~ {_end} ===")
+        otc = BondSummary_OTC()
+        df = otc.collect(start_date=str(_start_5y), end_date=str(_end))
+        if df is not None:
+            print(df.tail())
+            print(f"컬럼: {df.columns.tolist()}")
+        print()
+
+    # ── BondFutures ───────────────────────────────────────────────────────────
+    if run in ("all", "BondFutures"):
+        _start_futures = date(_end.year - 5, 1, 1)
+        print(f"=== BondFutures | {_start_futures} ~ {_end} ===")
+        bf = BondFutures()
+        df = bf.collect(start_date=str(_start_futures), end_date=str(_end), headless=False)
+        if df is not None:
+            print(df.tail())
+            print(f"컬럼 ({len(df.columns) - 1}개): {df.columns.tolist()}")
+        print()
+
+    # ── individual_bond ───────────────────────────────────────────────────────
+    if run in ("all", "individual_bond"):
+        _start_ib = _end - timedelta(days=6)
+        print(f"=== individual_bond | {_start_ib} ~ {_end} ===")
+        ib = individual_bond()
+        df = ib.collect(start_date=str(_start_ib), end_date=str(_end), headless=False)
+        if df is not None:
+            print(df.head())
+            print(f"컬럼 ({len(df.columns)}개): {df.columns.tolist()}")
+            print(f"수집 날짜: {sorted(df['Date'].unique())}")
+        print()
