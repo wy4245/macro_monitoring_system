@@ -227,9 +227,9 @@ if asset_class == "채권":
             for col in summary_df.columns:
                 col_label = col[1] if isinstance(col, tuple) else col
                 if "%" in col_label:
-                    format_dict[col] = "{:.1f}"   # % 단위: 소수점 1자리
+                    format_dict[col] = "{:.2f}"   # % 단위: 소수점 2자리
                 else:
-                    format_dict[col] = "{:.3f}"   # bp 단위: 소수점 3자리
+                    format_dict[col] = "{:.1f}"   # bp 단위: 소수점 1자리
 
             styled = summary_df.style.format(format_dict, na_rep="-")
             bp_cols = [c for c in summary_df.columns if "금리" not in c[1]]
@@ -296,7 +296,7 @@ if asset_class == "채권":
             curve_table = pd.DataFrame(curve_data, index=pd.Index(tenor_labels, name="만기"))
             curve_styled = (
                 curve_table.style
-                .format({"현재(%)": "{:.1f}", "1W(bp)": "{:.3f}", "1M(bp)": "{:.3f}"}, na_rep="-")
+                .format({"현재(%)": "{:.2f}", "1W(bp)": "{:.1f}", "1M(bp)": "{:.1f}"}, na_rep="-")
                 .map(_color_bp, subset=["1W(bp)", "1M(bp)"])
                 .set_properties(**{"text-align": "center"})
             )
@@ -320,8 +320,8 @@ if asset_class == "채권":
 
             bond_summary_df = _build_bond_summary(_bond_df, TARGET_DATE)
             bond_format = {
-                "금리 (%)": "{:.1f}", "1D": "{:.3f}", "1W": "{:.3f}",
-                "MTD": "{:.3f}", "MoM": "{:.3f}", "YTD": "{:.3f}", "YoY": "{:.3f}",
+                "금리 (%)": "{:.2f}", "1D": "{:.1f}", "1W": "{:.1f}",
+                "MTD": "{:.1f}", "MoM": "{:.1f}", "YTD": "{:.1f}", "YoY": "{:.1f}",
             }
             bp_cols_bond = [c for c in bond_summary_df.columns if c != "금리 (%)"]
             bond_styled = (
@@ -389,7 +389,7 @@ if asset_class == "채권":
                 )
                 ktb_styled = (
                     ktb_curve_table.style
-                    .format({"현재(%)": "{:.1f}", "1W(bp)": "{:.3f}", "1M(bp)": "{:.3f}"}, na_rep="-")
+                    .format({"현재(%)": "{:.2f}", "1W(bp)": "{:.1f}", "1M(bp)": "{:.1f}"}, na_rep="-")
                     .map(_color_bp, subset=["1W(bp)", "1M(bp)"])
                     .set_properties(**{"text-align": "center"})
                 )
@@ -491,10 +491,10 @@ if asset_class == "채권":
                         sig_df.style
                         .apply(_row_signal_style, axis=1)
                         .format({
-                            "현재(bp)":       "{:+.3f}",
-                            "5Y평균(bp)":     "{:+.3f}",
-                            "5Y표준편차(bp)": "{:.3f}",
-                            "Z-score":        "{:+.3f}",
+                            "현재(bp)":       "{:+.1f}",
+                            "5Y평균(bp)":     "{:+.1f}",
+                            "5Y표준편차(bp)": "{:.1f}",
+                            "Z-score":        "{:+.2f}",
                         }, na_rep="-")
                         .format({"시그널": _fmt_signal})
                         .set_properties(**{"text-align": "center"})
@@ -534,9 +534,9 @@ if asset_class == "채권":
                     otc_cmp_df.style
                     .apply(_row_signal_style_full, axis=1)
                     .format({
-                        "최종호가(%)":  "{:.1f}",
-                        "장외거래(%)":  "{:.1f}",
-                        "스프레드(bp)": "{:.3f}",
+                        "최종호가(%)":  "{:.2f}",
+                        "장외거래(%)":  "{:.2f}",
+                        "스프레드(bp)": "{:.1f}",
                     }, na_rep="-")
                     .format({"시그널": _fmt_signal})
                     .map(_color_bp, subset=["스프레드(bp)"])
@@ -576,7 +576,7 @@ if asset_class == "채권":
                 df_m_display = _merged_df.copy()
                 df_m_display.index = df_m_display.index.strftime("%Y-%m-%d")
                 st.dataframe(
-                    df_m_display.style.format("{:.1f}", na_rep="-").set_properties(**{"text-align": "center"}),
+                    df_m_display.style.format("{:.2f}", na_rep="-").set_properties(**{"text-align": "center"}),
                     use_container_width=True,
                 )
 
@@ -617,7 +617,7 @@ if asset_class == "채권":
                 df_bond_display.index   = df_bond_display.index.strftime("%Y-%m-%d")
                 df_bond_display.columns = [f"{BOND_LABELS.get(c, c)} ({c})" for c in df_bond_display.columns]
                 st.dataframe(
-                    df_bond_display.style.format("{:.1f}", na_rep="-").set_properties(**{"text-align": "center"}),
+                    df_bond_display.style.format("{:.2f}", na_rep="-").set_properties(**{"text-align": "center"}),
                     use_container_width=True,
                 )
 
@@ -658,7 +658,7 @@ if asset_class == "채권":
                 df_otc_display.index   = df_otc_display.index.strftime("%Y-%m-%d")
                 df_otc_display.columns = [f"{BOND_LABELS.get(c, c)} ({c})" for c in df_otc_display.columns]
                 st.dataframe(
-                    df_otc_display.style.format("{:.1f}", na_rep="-").set_properties(**{"text-align": "center"}),
+                    df_otc_display.style.format("{:.2f}", na_rep="-").set_properties(**{"text-align": "center"}),
                     use_container_width=True,
                 )
 
