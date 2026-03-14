@@ -230,6 +230,188 @@ tab_a, tab_b, ..., tab_new, tab_raw = st.tabs(["탭A", "탭B", ..., "새탭", "R
 
 ---
 
+#### ⬜ TAB-3: 현선(現先) 스프레드
+> 데이터: `bond_futures.parquet` (선물) + `individual_bonds/{year}.parquet` (현물)
+> Calculator 신규: `modules/calculator/bond_futures.py`
+> 표시 대상: **업데이트 기준일 기준 값이 존재하는 종목만** (현재 10개)
+
+---
+
+##### 데이터 구조 & 매칭 방법
+
+**bond_futures 컬럼명 파싱**
+
+컬럼명 형식: `국고채  {COUPON}-{MATYYММ}({ISSYY}-{N})`
+(국고채 뒤 공백 **2개**, 인코딩 깨져 `????ä??  ...` 로 표시됨)
+
+예시:
+```
+'????ä??  02750-2812(25-10)'  → 국고채  02750-2812(25-10)
+'????ä??  03250-3512(25-11)'  → 국고채  03250-3512(25-11)
+'????ä??  02625-5503(25-2)'   → 국고채  02625-5503(25-2)
+```
+
+정규식 파싱:
+```python
+m = re.search(r'(\d{5})-(\d{4})\((\d{2})-(\d+)\)', col)
+coupon       = int(m.group(1)) / 10000       # 02750 → 2.750%
+mat_yymm     = m.group(2)                    # "2812"
+mat_year     = 2000 + int(mat_yymm[:2])      # 28 → 2028
+mat_month    = int(mat_yymm[2:])             # 12 → 12월
+iss_year     = 2000 + int(m.group(3))        # 25 → 2025
+series       = m.group(4)                    # "10"
+code         = m.group(0)                    # "02750-2812(25-10)"  ← 매칭 키
+```
+
+**individual_bonds 종목명 파싱**
+
+컬럼명 인코딩 깨짐 → **인덱스 번호로 접근** (컬럼 순서 고정 확인됨):
+
+| 인덱스 | 실제 컬럼명 | 사용 |
+|--------|-------------|------|
+| [0] | Date | ✅ |
+| [3] | 종목명 | ✅ 매칭 키 추출 |
+| [6] | 평균 수익률 | ✅ 현물 수익률 |
+
+종목명 형식: `국고채 {COUPON}-{MATYYMM}({ISSYY}-{N})`
+(공백 **1개**, 인코딩 깨져 `????ä?? 02750-2812(25-10)` 로 표시됨)
+
+파싱:
+```python
+# individual_bonds의 col[3] (종목명) 에서 동일 정규식으로 code 추출
+m = re.search(r'(\d{5}-\d{4}\(\d{2}-\d+\))', bond_name)
+code = m.group(1) if m else None   # "02750-2812(25-10)"
+```
+
+bond_futures의 `code`와 individual_bonds의 `code`가 **정확히 동일** → inner merge 가능.
+
+---
+
+##### 테너(만기) 분류 방법
+
+`issuance_year`는 발행 월을 알 수 없으므로 **연도 차이만** 사용:
+
+```python
+year_diff = mat_year - iss_year
+```
+
+실제 데이터로 검증된 매핑:
+
+| 예시 코드 | mat_year | iss_year | year_diff | 분류 |
+|-----------|----------|----------|-----------|------|
+| `01250-2212(19-7)` | 2022 | 2019 | 3 | **3Y** |
+| `01375-2912(19-8)` | 2029 | 2019 | 10 | **10Y** |
+| `01500-2503(20-1)` | 2025 | 2020 | 5 | **5Y** |
+| `02625-3003(25-3)` | 2030 | 2025 | 5 | **5Y** |
+| `02625-5503(25-2)` | 2055 | 2025 | 30 | **30Y** |
+| `03250-3512(25-11)` | 2035 | 2025 | 10 | **10Y** |
+
+분류 함수:
+```python
+def classify_tenor(year_diff: int) -> str:
+    if year_diff <= 4:   return "3Y"
+    if year_diff <= 7:   return "5Y"
+    if year_diff <= 15:  return "10Y"
+    if year_diff <= 25:  return "20Y"   # 현재 데이터에 없음
+    if year_diff <= 40:  return "30Y"
+    return "50Y"                         # 현재 데이터에 없음
+```
+
+**현재 bond_futures 전체 44개 종목의 테너 분포** (2021-03 ~ 2026-03):
+- 3Y: 12개 종목 (01250-2212, 01000-2306, 00875-2312, 01125-2406, 01875-2412, 03125-2506, 03125-2709, 04250-2512, 03125-2606, 03875-2612, 03250-2706, 02875-2712, 02250-2806, 02750-2812)
+- 5Y: 12개 종목 (01500-2503, 01125-2509, 01250-2603, 01750-2609, 02375-2703, 03250-2803, 03500-2809, 03250-2903, 03000-2909, 02625-3003, 02500-3009, 02625-3003)
+- 10Y: 12개 종목 (01375-2912, 01375-3006, 01500-3012, 02000-3106, 02375-3112, 03375-3206, 04250-3212, 03250-3306, 04125-3312, 03500-3406, 03000-3412, 02625-3506, 03250-3512)
+- 30Y: 8개 종목 (03625-5309, 03250-5303, 03250-5403, 02750-5409, 02625-5503, 02625-5509 등)
+
+---
+
+##### 스프레드 계산
+
+```
+spread_bp = (individual_bond 평균수익률 - bond_futures 수익률) × 100
+```
+
+양수(+) = 현물이 선물보다 수익률 높음 (현물 상대적 저평가)
+음수(-) = 현물이 선물보다 수익률 낮음 (현물 상대적 고평가)
+
+날짜 주의: bond_futures와 individual_bonds 최신 날짜가 다를 수 있음 → inner merge로 공통 날짜만 사용, 기준일 불일치 시 UI에 안내.
+
+---
+
+##### Z-score 계산 (테너 그룹 pooling)
+
+핵심 아이디어: 개별 종목의 역사가 ~300일밖에 없어 Z-score 기반 약함 → **같은 테너의 과거 모든 종목 스프레드를 pooling**해서 역사적 분포를 구성.
+
+```python
+def calc_zscore(spread_df, active_codes, target_date):
+    results = []
+    for code in active_codes:
+        tenor = spread_df.loc[spread_df.code == code, 'tenor'].iloc[0]
+
+        # 같은 테너 전체 5년 스프레드 pooling (현재 종목 포함)
+        hist = spread_df[spread_df.tenor == tenor]['spread_bp']
+        mean = hist.mean()
+        std  = hist.std()
+
+        # 현재 스프레드
+        today_row = spread_df[(spread_df.code == code) & (spread_df.Date == target_date)]
+        current = today_row['spread_bp'].iloc[0]
+
+        zscore = (current - mean) / std if std > 0 else float('nan')
+        results.append({...})
+    return pd.DataFrame(results)
+```
+
+테너별 pooling 데이터량 (현재 기준):
+| 테너 | 종목 수 | 종목당 평균 활성일 | 총 데이터 포인트 |
+|------|---------|-------------------|-----------------|
+| 3Y | ~14개 | ~300일 | **~4,200일** |
+| 5Y | ~12개 | ~300일 | **~3,600일** |
+| 10Y | ~13개 | ~300일 | **~3,900일** |
+| 30Y | ~8개 | ~250일 | **~2,000일** |
+
+---
+
+##### 신호 기준 (tab_otc 동일)
+
+| Z-score 범위 | 신호 | 색상 |
+|---|---|---|
+| `\|Z\| > 2.0` | 🔴 경고 | `#ff4b4b` |
+| `1.5 < \|Z\| ≤ 2.0` | 🟡 주의 | `#ffa500` |
+| `\|Z\| ≤ 1.5` | 🟢 정상 | `#00cc88` |
+
+---
+
+##### 구현 파일 목록
+
+1. **`modules/calculator/bond_futures.py`** (신규)
+   - `class BondFuturesCalc`
+   - `parse_bond_code(col: str) -> dict | None`
+   - `load_individual_bonds(data_dir, years) -> pd.DataFrame` — KTB 필터, 인덱스 접근
+   - `build_spread_df(bf_df, ib_df) -> pd.DataFrame` — melt → merge → spread_bp 계산
+   - `calc_zscore(spread_df, active_codes, target_date) -> pd.DataFrame`
+
+2. **`main.py`** 수정
+   - `@st.cache_data` 로드 함수 2개 추가: `_load_bond_futures()`, `_load_individual_bonds_ktb()`
+   - `st.tabs([..., "📊 현선 스프레드", ...])` 추가
+   - `with tab_futures:` 블록 구현
+     - 기준일 + 데이터 불일치 안내 (bond_futures 최신 날짜 vs individual_bonds 최신 날짜)
+     - 요약 테이블: 종목명 / 테너 / 선물수익률(%) / 현물수익률(%) / 스프레드(bp) / Z-score / 신호
+     - 히스토리 차트: 테너별 스프레드 시계열 (Plotly, 각 종목 라인)
+
+---
+
+##### 엣지케이스 처리
+
+| 케이스 | 처리 |
+|--------|------|
+| 컬럼명 한글 깨짐 | 정규식으로 코드 부분만 추출 (한글 불필요) |
+| 날짜 불일치 | inner merge; UI에 "현물 기준일: XXXX-XX-XX" 표시 |
+| 30Y 데이터 부족 | pooling 결과 min 200개 이상이면 Z-score 표시, 미만이면 NaN |
+| individual_bonds 미수집 날짜 | inner merge로 자동 제외 |
+
+---
+
 ### 장기 계획
 
 - [ ] **주식 섹션 구현** (사이드바에 이미 `[주식]` 라디오 버튼 있음, 미구현)

@@ -9,6 +9,7 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 
 from modules.calculator.global_treasury import TreasuryCalc
+from modules.calculator.bond_futures import parse_bond_code, calc_zscore
 
 
 # ─── 페이지 기본 설정 ──────────────────────────────────────────────────────────
@@ -63,11 +64,48 @@ def _load_bond() -> pd.DataFrame | None:
         return None
 
 
+def _load_bond_futures() -> pd.DataFrame | None:
+    """data/bond_futures.parquet 에서 국채선물 데이터를 로드합니다."""
+    path = os.path.join("data", "bond_futures.parquet")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_parquet(path)
+        df.index.name = "Date"
+        return df
+    except Exception as e:
+        print(f"[BondFutures] 파일 읽기 오류: {e}")
+        return None
+
+
+@st.cache_data(show_spinner="현선 스프레드 데이터 로드 중...")
+def _compute_spread_data() -> pd.DataFrame:
+    """bond_futures + individual_bonds 스프레드 DataFrame 계산 (캐시)."""
+    from modules.calculator.bond_futures import load_individual_bonds_ktb, build_spread_df
+
+    bf_path = os.path.join("data", "bond_futures.parquet")
+    if not os.path.exists(bf_path):
+        return pd.DataFrame()
+
+    bf_df = pd.read_parquet(bf_path)
+    bf_df.index.name = "Date"
+
+    bf_codes = set()
+    for col in bf_df.columns:
+        info = parse_bond_code(col)
+        if info:
+            bf_codes.add(info["code"])
+
+    ib_df = load_individual_bonds_ktb("data", bf_codes)
+    return build_spread_df(bf_df, ib_df)
+
+
 # ─── 앱 시작 시 사전 계산 ────────────────────────────────────────────────────
 
 _global_df: pd.DataFrame | None = _load_global()
 _bond_df:   pd.DataFrame | None = _load_bond()
 _otc_df:    pd.DataFrame | None = _load_otc()
+_bf_df:     pd.DataFrame | None = _load_bond_futures()
 
 # bond_summary의 KTB_nY 컬럼을 KR_nY 형식으로 변환하여 글로벌 데이터와 병합
 _merged_df: pd.DataFrame | None = None
@@ -201,8 +239,8 @@ with st.sidebar:
 
 if asset_class == "채권":
 
-    tab_global, tab_domestic, tab_otc, tab_raw = st.tabs([
-        "글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "Raw Data",
+    tab_global, tab_domestic, tab_otc, tab_spread, tab_raw = st.tabs([
+        "글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "📊 현선 스프레드", "Raw Data",
     ])
 
     # ── 글로벌 국채 금리 ─────────────────────────────────────────────────────
@@ -544,9 +582,181 @@ if asset_class == "채권":
                 )
                 st.dataframe(otc_cmp_styled, use_container_width=True)
 
+    # ── 현선 스프레드 ────────────────────────────────────────────────────────
+    with tab_spread:
+        if _bf_df is None:
+            st.error(
+                "국채선물 데이터 파일이 없습니다.  \n"
+                "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
+            )
+        else:
+            _spread_df = _compute_spread_data()
+
+            if _spread_df.empty:
+                st.error(
+                    "현선 스프레드 계산에 필요한 individual_bonds 데이터가 없습니다.  \n"
+                    "로컬 PC에서 `python collect_data.py` 실행 후 `git push` 해주세요."
+                )
+            else:
+                # 기준일 정보
+                bf_latest = _bf_df.index.max().date()
+                ib_latest = _spread_df["Date"].max().date()
+
+                caption_parts = [
+                    f"Source: KOFIA  ·  선물 기준일: {bf_latest}  ·  현물 기준일: {ib_latest}",
+                    "스프레드(bp) = 현물 평균수익률 − 선물수익률",
+                ]
+                if bf_latest != ib_latest:
+                    caption_parts.append(f"⚠️ 선물·현물 기준일 불일치 — 현물 최신 데이터: {ib_latest}")
+                st.caption("  ·  ".join(caption_parts[:2]))
+                if bf_latest != ib_latest:
+                    st.warning(f"선물 기준일({bf_latest})과 현물 기준일({ib_latest})이 다릅니다. 현물 기준 최신 날짜 기준으로 표시됩니다.")
+
+                # 활성 종목 (선물 최신일 기준 비NaN)
+                bf_latest_ts = _bf_df.index.max()
+                latest_row   = _bf_df.loc[bf_latest_ts]
+                active_codes = []
+                for col in _bf_df.columns:
+                    if pd.notna(latest_row[col]):
+                        info = parse_bond_code(col)
+                        if info:
+                            active_codes.append(info["code"])
+
+                # Z-score 계산
+                spread_target = pd.Timestamp(ib_latest)
+                zscore_df = calc_zscore(_spread_df, active_codes, spread_target)
+
+                def _get_signal(z) -> str:
+                    if pd.isna(z):    return "Normal"
+                    if abs(z) >= 2.0: return "Warning"
+                    if abs(z) >= 1.5: return "Caution"
+                    return "Normal"
+
+                if not zscore_df.empty:
+                    zscore_df["signal"] = zscore_df["z_score"].apply(_get_signal)
+
+                    n_warning = (zscore_df["signal"] == "Warning").sum()
+                    n_caution = (zscore_df["signal"] == "Caution").sum()
+                    n_normal  = (zscore_df["signal"] == "Normal").sum()
+
+                    # ── 시그널 배너 ───────────────────────────────────────
+                    st.subheader("현선 스프레드 이상 시그널")
+                    st.caption(
+                        "테너별 pooling 5Y 통계 기반  ·  |Z| ≥ 1.5σ: Caution  ·  |Z| ≥ 2.0σ: Warning  ·  "
+                        "min 200 데이터포인트 미만 테너는 Z-score '-' 표시"
+                    )
+                    col_w, col_c, col_n = st.columns(3)
+                    col_w.metric("🔴 Warning", f"{n_warning}종목")
+                    col_c.metric("🟡 Caution", f"{n_caution}종목")
+                    col_n.metric("🟢 정상",    f"{n_normal}종목")
+
+                    st.divider()
+
+                    # ── 종목별 요약 테이블 ────────────────────────────────
+                    st.subheader("활성 종목 현황")
+
+                    _SIG_WARNING_BG = "background-color: rgba(255, 75, 75, 0.18)"
+                    _SIG_CAUTION_BG = "background-color: rgba(255, 165, 0, 0.18)"
+
+                    def _fmt_signal_spread(val):
+                        if val == "Warning": return "🔴 Warning"
+                        if val == "Caution": return "🟡 Caution"
+                        return "🟢 정상"
+
+                    TENOR_ORDER = {"3Y": 0, "5Y": 1, "10Y": 2, "20Y": 3, "30Y": 4, "50Y": 5}
+                    zscore_sorted = zscore_df.sort_values(
+                        ["tenor", "code"],
+                        key=lambda s: s.map(TENOR_ORDER) if s.name == "tenor" else s,
+                    ).reset_index(drop=True)
+
+                    display_df = zscore_sorted[[
+                        "code", "tenor", "futures_yield", "spot_yield",
+                        "spread_bp", "spread_mean", "spread_std", "z_score", "signal",
+                    ]].copy()
+                    display_df.columns = [
+                        "종목코드", "테너", "선물수익률(%)", "현물수익률(%)",
+                        "스프레드(bp)", "평균(bp)", "표준편차(bp)", "Z-score", "시그널",
+                    ]
+                    display_df.index = range(1, len(display_df) + 1)
+
+                    def _row_bg(row):
+                        sig = row["시그널"]
+                        if sig == "Warning": bg = _SIG_WARNING_BG
+                        elif sig == "Caution": bg = _SIG_CAUTION_BG
+                        else: bg = ""
+                        return [bg] * len(row)
+
+                    spread_styled = (
+                        display_df.style
+                        .apply(_row_bg, axis=1)
+                        .format({
+                            "선물수익률(%)":  "{:.2f}",
+                            "현물수익률(%)":  "{:.2f}",
+                            "스프레드(bp)":   "{:+.1f}",
+                            "평균(bp)":       "{:+.1f}",
+                            "표준편차(bp)":   "{:.1f}",
+                            "Z-score":        lambda v: f"{v:+.2f}" if pd.notna(v) else "-",
+                            "시그널":         _fmt_signal_spread,
+                        }, na_rep="-")
+                        .map(_color_bp, subset=["스프레드(bp)"])
+                        .set_properties(**{"text-align": "center"})
+                    )
+                    st.dataframe(spread_styled, use_container_width=True)
+
+                    st.divider()
+
+                    # ── 스프레드 히스토리 차트 ────────────────────────────
+                    st.subheader("스프레드 히스토리")
+
+                    avail_tenors = sorted(
+                        _spread_df["tenor"].dropna().unique(),
+                        key=lambda t: TENOR_ORDER.get(t, 99),
+                    )
+                    # 활성 종목이 있는 테너만 표시
+                    active_tenors = [t for t in avail_tenors if t in zscore_df["tenor"].values]
+                    selected_tenor = st.selectbox(
+                        "테너 선택",
+                        options=active_tenors if active_tenors else avail_tenors,
+                        key="spread_tenor",
+                    )
+
+                    tenor_spread = _spread_df[_spread_df["tenor"] == selected_tenor].copy()
+                    active_codes_tenor = zscore_df.loc[
+                        zscore_df["tenor"] == selected_tenor, "code"
+                    ].tolist()
+
+                    fig_spread = go.Figure()
+                    # 활성 종목(굵게) + 비활성 종목(흐리게) 구분
+                    for code in tenor_spread["code"].unique():
+                        code_data = tenor_spread[tenor_spread["code"] == code].sort_values("Date")
+                        is_active = code in active_codes_tenor
+                        fig_spread.add_trace(go.Scatter(
+                            x=code_data["Date"],
+                            y=code_data["spread_bp"],
+                            mode="lines",
+                            name=code,
+                            line=dict(width=2.0 if is_active else 1.0),
+                            opacity=1.0 if is_active else 0.35,
+                        ))
+
+                    # y=0 기준선
+                    fig_spread.add_hline(
+                        y=0, line_dash="dash", line_color="gray",
+                        annotation_text="0bp", annotation_position="right",
+                    )
+                    fig_spread.update_layout(
+                        title=f"국고채 {selected_tenor} 현선 스프레드 시계열",
+                        xaxis_title="날짜",
+                        yaxis_title="스프레드 (bp)",
+                        hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig_spread, use_container_width=True)
+                    st.caption("굵은 선: 현재 활성 종목  ·  흐린 선: 만기 도래 전 과거 종목  ·  양수(+) = 현물 수익률 > 선물 수익률")
+
     # ── Raw Data ─────────────────────────────────────────────────────────────
     with tab_raw:
-        raw1, raw2, raw3 = st.tabs(["글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률"])
+        raw1, raw2, raw3, raw4 = st.tabs(["글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "현선 스프레드"])
 
         # ── 글로벌 국채 금리 raw ─────────────────────────────────────────────
         with raw1:
@@ -661,6 +871,47 @@ if asset_class == "채권":
                     df_otc_display.style.format("{:.2f}", na_rep="-").set_properties(**{"text-align": "center"}),
                     use_container_width=True,
                 )
+
+        # ── 현선 스프레드 raw ────────────────────────────────────────────────
+        with raw4:
+            st.caption("국채선물 · 개별채권 현선 스프레드 원본 데이터")
+            if _bf_df is None:
+                st.info("데이터를 불러오지 못했습니다.")
+            else:
+                _spread_raw = _compute_spread_data()
+                if _spread_raw.empty:
+                    st.info("스프레드 데이터가 없습니다.")
+                else:
+                    raw_cols = st.multiselect(
+                        "종목 선택",
+                        options=sorted(_spread_raw["code"].unique()),
+                        default=sorted(
+                            _spread_raw[_spread_raw["Date"] == _spread_raw["Date"].max()]["code"].unique()
+                        )[:5],
+                        key="spread_raw_codes",
+                    )
+                    if raw_cols:
+                        df_spread_plot = _spread_raw[_spread_raw["code"].isin(raw_cols)]
+                        fig_raw = px.line(
+                            df_spread_plot, x="Date", y="spread_bp", color="code",
+                            title="현선 스프레드 시계열 (bp)",
+                        )
+                        fig_raw.add_hline(y=0, line_dash="dash", line_color="gray")
+                        fig_raw.update_layout(hovermode="x unified")
+                        st.plotly_chart(fig_raw, use_container_width=True)
+
+                    df_spread_display = _spread_raw.copy()
+                    df_spread_display["Date"] = df_spread_display["Date"].dt.strftime("%Y-%m-%d")
+                    st.dataframe(
+                        df_spread_display.style
+                        .format({
+                            "futures_yield": "{:.2f}",
+                            "spot_yield":    "{:.2f}",
+                            "spread_bp":     "{:+.1f}",
+                        }, na_rep="-")
+                        .set_properties(**{"text-align": "center"}),
+                        use_container_width=True,
+                    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
