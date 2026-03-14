@@ -495,8 +495,8 @@ if asset_class == "채권":
                             "5Y평균(bp)":     "{:+.1f}",
                             "5Y표준편차(bp)": "{:.1f}",
                             "Z-score":        "{:+.2f}",
+                            "시그널":         _fmt_signal,
                         }, na_rep="-")
-                        .format({"시그널": _fmt_signal})
                         .set_properties(**{"text-align": "center"})
                     )
                     st.dataframe(sig_styled, use_container_width=True)
@@ -537,8 +537,8 @@ if asset_class == "채권":
                         "최종호가(%)":  "{:.2f}",
                         "장외거래(%)":  "{:.2f}",
                         "스프레드(bp)": "{:.1f}",
+                        "시그널":       _fmt_signal,
                     }, na_rep="-")
-                    .format({"시그널": _fmt_signal})
                     .map(_color_bp, subset=["스프레드(bp)"])
                     .set_properties(**{"text-align": "center"})
                 )
