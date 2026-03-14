@@ -748,6 +748,30 @@ if asset_class == "채권":
                         y=0, line_dash="dash", line_color="gray",
                         annotation_text="0bp", annotation_position="right",
                     )
+
+                    # ±1.5σ / ±2σ 기준선 (테너별 pooled 통계)
+                    _tenor_hist = _spread_df[_spread_df["tenor"] == selected_tenor]["spread_bp"].dropna()
+                    if len(_tenor_hist) >= 10:
+                        _hmean = _tenor_hist.mean()
+                        _hstd  = _tenor_hist.std()
+                        _band_lines = [
+                            (1.5, "rgba(255,165,0,0.85)", "+1.5σ", "-1.5σ"),
+                            (2.0, "rgba(255,75,75,0.85)",  "+2.0σ", "-2.0σ"),
+                        ]
+                        for mult, color, pos_label, neg_label in _band_lines:
+                            fig_spread.add_hline(
+                                y=_hmean + mult * _hstd,
+                                line_dash="dot", line_color=color, line_width=1.5,
+                                annotation_text=pos_label, annotation_position="right",
+                                annotation_font_color=color,
+                            )
+                            fig_spread.add_hline(
+                                y=_hmean - mult * _hstd,
+                                line_dash="dot", line_color=color, line_width=1.5,
+                                annotation_text=neg_label, annotation_position="right",
+                                annotation_font_color=color,
+                            )
+
                     fig_spread.update_layout(
                         title=f"국고채 {selected_tenor} 현선 스프레드 시계열",
                         xaxis_title="날짜",
