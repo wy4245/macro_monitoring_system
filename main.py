@@ -241,7 +241,7 @@ with st.sidebar:
 if asset_class == "채권":
 
     tab_global, tab_domestic, tab_otc, tab_spread, tab_raw = st.tabs([
-        "글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "📊 현선 스프레드", "Raw Data",
+        "글로벌 국채 금리", "국내 채권 금리", "장외거래 대표수익률", "현선 스프레드", "Raw Data",
     ])
 
     # ── 글로벌 국채 금리 ─────────────────────────────────────────────────────
@@ -678,6 +678,7 @@ if asset_class == "채권":
                         "종목코드", "테너", "선물수익률(%)", "현물수익률(%)",
                         "스프레드(bp)", "평균(bp)", "표준편차(bp)", "Z-score", "시그널",
                     ]
+                    display_df["종목코드"] = "국고채권 " + display_df["종목코드"]
                     display_df.index = range(1, len(display_df) + 1)
 
                     def _row_bg(row):
@@ -722,6 +723,8 @@ if asset_class == "채권":
                     )
 
                     tenor_spread = _spread_df[_spread_df["tenor"] == selected_tenor].copy()
+                    _one_year_ago = spread_target - pd.DateOffset(years=1)
+                    tenor_spread = tenor_spread[tenor_spread["Date"] >= _one_year_ago]
                     active_codes_tenor = zscore_df.loc[
                         zscore_df["tenor"] == selected_tenor, "code"
                     ].tolist()
