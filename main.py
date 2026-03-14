@@ -228,6 +228,7 @@ with st.sidebar:
             st.success(_result.stdout.strip() or "이미 최신 상태입니다.")
         else:
             st.error(f"git pull 실패:\n{_result.stderr.strip()}")
+        st.cache_data.clear()
         st.rerun()
 
     asset_class = st.radio("", ["채권", "주식"], label_visibility="collapsed")
